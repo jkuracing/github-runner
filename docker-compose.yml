@@ -1,0 +1,13 @@
+services:
+  github-runner:
+    build: .
+    restart: unless-stopped
+    environment:
+      URL: ${URL}
+      RUNNER_TOKEN: ${RUNNER_TOKEN}
+      RUNNER_NAME: ${RUNNER_NAME}
+    volumes:
+      - runner-data:/actions-runner
+
+volumes:
+  runner-data:
