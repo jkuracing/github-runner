@@ -6,8 +6,8 @@ services:
       URL: ${URL}
       RUNNER_TOKEN: ${RUNNER_TOKEN}
       RUNNER_NAME: ${RUNNER_NAME}
-    volumes:
-      - runner-data:/actions-runner
+    deploy:
+      replicas: ${RUNNER_COUNT:-1}
 
 volumes:
   runner-data:
