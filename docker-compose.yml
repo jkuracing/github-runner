@@ -6,6 +6,7 @@ services:
       URL: ${URL}
       RUNNER_TOKEN: ${RUNNER_TOKEN}
       RUNNER_NAME: ${RUNNER_NAME}
+      RUNNER_LABELS: ${RUNNER_LABELS}
     deploy:
       replicas: ${RUNNER_COUNT:-1}
 
