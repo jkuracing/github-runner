@@ -17,7 +17,7 @@ RUN apt-get update && \
 # ============================================================================
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential pkg-config libssl-dev \
+        build-essential pkg-config libssl-dev libudev-dev \
         openssh-client unzip wget \
         python3.12 python3.12-venv python3.12-dev python3-cffi && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
