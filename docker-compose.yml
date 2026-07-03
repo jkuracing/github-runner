@@ -1,9 +1,11 @@
 services:
   github-runner:
     build: .
-    restart: unless-stopped
+    restart: on-failure:5
+    stop_grace_period: 5m
     environment:
       URL: ${URL}
+      GITHUB_PAT: ${GITHUB_PAT}
       RUNNER_TOKEN: ${RUNNER_TOKEN}
       RUNNER_NAME: ${RUNNER_NAME}
       RUNNER_LABELS: ${RUNNER_LABELS}

@@ -36,7 +36,8 @@ This runner includes all tools required for the firmware CI pipeline:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `URL` | Yes | GitHub repository or organization URL |
-| `RUNNER_TOKEN` | Yes | Runner registration token from GitHub |
+| `GITHUB_PAT` | One of `GITHUB_PAT` / `RUNNER_TOKEN` | Personal access token used to mint a fresh registration token on every container start. Preferred, since it never goes stale. Needs `admin:org` scope (classic PAT) for org-level runners, or `repo`/Administration for repo-level runners. |
+| `RUNNER_TOKEN` | One of `GITHUB_PAT` / `RUNNER_TOKEN` | Static runner registration token from GitHub. Expires ~1 hour after creation, so restarts after that will fail unless refreshed. Ignored if `GITHUB_PAT` is set. |
 | `RUNNER_NAME` | No | Base name for the runner (default: `runner`) |
 | `RUNNER_LABELS` | No | Comma-separated labels for the runner |
 
@@ -44,8 +45,8 @@ This runner includes all tools required for the firmware CI pipeline:
 
 ```bash
 # Set environment variables
-export URL=https://github.com/jkuracing/vehicle-software
-export RUNNER_TOKEN=<your-token>
+export URL=https://github.com/jkuracing
+export GITHUB_PAT=<your-pat>
 
 # Start the runner
 docker compose up -d
