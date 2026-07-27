@@ -57,27 +57,31 @@ docker buildx build --platform linux/arm64 -t github-runner .
 | `RUNNER_TOKEN` | One of `GITHUB_PAT` / `RUNNER_TOKEN` | Static runner registration token from GitHub. Expires ~1 hour after creation, so restarts after that will fail unless refreshed. Ignored if `GITHUB_PAT` is set. |
 | `RUNNER_NAME` | No | Base name for the runner (default: `runner`) |
 | `RUNNER_LABELS` | No | Comma-separated labels for the runner |
-| `RUNNER_COUNT` | No | Number of runner replicas (default: `4`) |
-| `RUNNER_CPUS` | No | CPUs per replica; also caps `CARGO_BUILD_JOBS` (default: `4`) |
-| `RUNNER_MEMORY` | No | Memory per replica (default: `10g`) |
+| `RUNNER_COUNT` | No | Number of runner replicas (default: `8`) |
+| `RUNNER_CPUS` | No | CPUs per replica; also caps `CARGO_BUILD_JOBS` (default: `2`) |
+| `RUNNER_MEMORY` | No | Memory per replica (default: `6g`) |
 
 ### Parallel Jobs
 
 A GitHub Actions runner executes **one job at a time** — there is no concurrency
 setting inside the runner. Total parallelism is therefore just `RUNNER_COUNT`.
 
-The defaults (4 replicas x 4 CPUs x 10 GB) target a 16-core / 64 GB host. Each
+The defaults (8 replicas x 2 CPUs x 6 GB) target a 16-core / 64 GB host. Each
 replica gets a hard CPU and memory limit, and `CARGO_BUILD_JOBS` is pinned to
 `RUNNER_CPUS` — without that, cargo sizes its thread pool from the *host* core
 count and every replica would spawn ~16 threads, oversubscribing the machine.
 
-Raising `RUNNER_COUNT` past the core count trades per-job latency for throughput:
-8 replicas x 2 CPUs runs twice as many jobs, but each Rust build is much slower.
-Prefer more replicas only if your jobs are mostly light (fmt, clippy, tests)
-rather than full firmware builds.
+**Memory, not CPU, is what limits the replica count.** 8 x 6 GB = 48 GB of the
+~58 GB the OrbStack VM exposes. Raising `RUNNER_COUNT` without lowering
+`RUNNER_MEMORY` will overcommit and get builds OOM-killed.
+
+A single CI run only reaches 5 concurrent jobs (four checks in parallel, then
+three builds behind `needs`). The reason more replicas still help is that
+`concurrency` in `firmware_ci.yml` is keyed per *branch*, so several runs
+execute at once and jobs queue globally.
 
 ```bash
-RUNNER_COUNT=8 RUNNER_CPUS=2 RUNNER_MEMORY=6g docker compose up -d --build
+RUNNER_COUNT=4 RUNNER_CPUS=4 RUNNER_MEMORY=10g docker compose up -d --build
 ```
 
 ### Caching

@@ -16,7 +16,7 @@ services:
       # replica would spawn ~16 threads and N replicas would oversubscribe the
       # machine N-fold. The cpus limit below only throttles the result; capping
       # the thread count is what actually avoids the thrashing.
-      CARGO_BUILD_JOBS: ${RUNNER_CPUS:-4}
+      CARGO_BUILD_JOBS: ${RUNNER_CPUS:-2}
     volumes:
       # Shared crate download cache. Only the registry is shared, not the whole
       # CARGO_HOME: cargo locks this directory, so concurrent replicas are safe,
@@ -24,13 +24,16 @@ services:
       # re-downloads the full dependency set on a cold start.
       - cargo-registry:/home/runner/.cargo/registry
     deploy:
-      replicas: ${RUNNER_COUNT:-4}
+      replicas: ${RUNNER_COUNT:-8}
       resources:
         limits:
-          # Sized for a 16-core / 64 GB host, leaving headroom for macOS itself.
-          # 4 x 4 CPUs saturates the machine without oversubscribing it.
-          cpus: ${RUNNER_CPUS:-4}
-          memory: ${RUNNER_MEMORY:-10g}
+          # Sized for a 16-core / 64 GB host. Memory is the binding constraint,
+          # not CPU: 8 x 6g = 48 GB of the ~58 GB the VM exposes, leaving
+          # headroom for the host. CPUs are deliberately oversubscribed 1:1
+          # (8 x 2 = 16) because jobs spend much of their wall time on network
+          # and link steps rather than pegged compute.
+          cpus: ${RUNNER_CPUS:-2}
+          memory: ${RUNNER_MEMORY:-6g}
 
 volumes:
   cargo-registry:
