@@ -57,7 +57,6 @@ docker buildx build --platform linux/arm64 -t github-runner .
 | `RUNNER_TOKEN` | One of `GITHUB_PAT` / `RUNNER_TOKEN` | Static runner registration token from GitHub. Expires ~1 hour after creation, so restarts after that will fail unless refreshed. Ignored if `GITHUB_PAT` is set. |
 | `RUNNER_NAME` | No | Base name for the runner (default: `runner`) |
 | `RUNNER_LABELS` | No | Comma-separated labels for the runner |
-| `RUNNER_COUNT` | No | Number of runner replicas (default: `8`) |
 | `RUNNER_CPUS` | No | CPUs per replica; also caps `CARGO_BUILD_JOBS` (default: `2`) |
 | `RUNNER_MEMORY` | No | Memory per replica (default: `6g`) |
 
@@ -66,30 +65,49 @@ docker buildx build --platform linux/arm64 -t github-runner .
 A GitHub Actions runner executes **one job at a time** — there is no concurrency
 setting inside the runner. Total parallelism is therefore just `RUNNER_COUNT`.
 
-The defaults (8 replicas x 2 CPUs x 6 GB) target a 16-core / 64 GB host. Each
-replica gets a hard CPU and memory limit, and `CARGO_BUILD_JOBS` is pinned to
-`RUNNER_CPUS` — without that, cargo sizes its thread pool from the *host* core
-count and every replica would spawn ~16 threads, oversubscribing the machine.
+Eight replicas (`runner-1` .. `runner-8`) are declared explicitly in
+`docker-compose.yml`, at 2 CPUs and 6 GB each, sized for a 16-core / 64 GB host.
+`CARGO_BUILD_JOBS` is pinned to `RUNNER_CPUS` — without that, cargo sizes its
+thread pool from the *host* core count and every replica would spawn ~16
+threads, oversubscribing the machine.
 
 **Memory, not CPU, is what limits the replica count.** 8 x 6 GB = 48 GB of the
-~58 GB the OrbStack VM exposes. Raising `RUNNER_COUNT` without lowering
-`RUNNER_MEMORY` will overcommit and get builds OOM-killed.
+~58 GB the OrbStack VM exposes. Adding replicas without lowering `RUNNER_MEMORY`
+will overcommit and get builds OOM-killed.
 
 A single CI run only reaches 5 concurrent jobs (four checks in parallel, then
 three builds behind `needs`). The reason more replicas still help is that
 `concurrency` in `firmware_ci.yml` is keyed per *branch*, so several runs
 execute at once and jobs queue globally.
 
+To run fewer runners, name the services; to run bigger ones, raise the limits:
+
 ```bash
-RUNNER_COUNT=4 RUNNER_CPUS=4 RUNNER_MEMORY=10g docker compose up -d --build
+docker compose up -d --build runner-1 runner-2 runner-3
+RUNNER_CPUS=4 RUNNER_MEMORY=10g docker compose up -d --build
 ```
+
+> Replicas are separate services rather than `deploy.replicas` because a scaled
+> service shares one set of volumes, and sccache cannot safely share a cache
+> directory between concurrent server processes (see below).
 
 ### Caching
 
-Replicas share a `cargo-registry` volume, so crates are downloaded once rather
-than once per replica. Only the registry is shared — cargo locks it, making
-concurrent access safe, whereas a shared `target/` directory would race.
-Build artifacts are **not** shared or persisted across `docker compose down`.
+Two caches survive container recreation:
+
+- **`cargo-registry`** — shared by all replicas. Crates are downloaded once
+  rather than once per runner. Sharing is safe because cargo locks the registry.
+- **`sccache-N`** — one volume *per replica*. `setup-rust-dual` in the firmware
+  repo points sccache at `$HOME/.cache/sccache`, and sccache keeps an in-memory
+  LRU index per server process, so several containers sharing one cache
+  directory would evict against each other and corrupt it.
+
+The runner's `_work` directory is deliberately **not** persisted. The firmware
+workflow checks out with `clean: false` to reuse `target/`, but a stale
+submodule `target/` surviving `git submodule deinit` is what produced
+`could not parse/generate dep info ... No such file or directory` build
+failures. sccache is content-hashed and immune to that staleness, so it is the
+right layer to persist; `_work` is not.
 
 ### Running with Docker Compose
 

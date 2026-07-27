@@ -128,6 +128,10 @@ RUN useradd -m runner && \
     cp /root/export-esp.sh /home/runner/export-esp.sh 2>/dev/null || true && \
     # uv and its tools (maturin) live in /usr/local/bin and /opt/uv, which are
     # already on the shared PATH and readable by this user — nothing to copy.
+    # Pre-create the sccache directory so its named volume is seeded with runner
+    # ownership. A volume mounted over a path that does not exist in the image is
+    # created root-owned, which the unprivileged runner cannot write to.
+    mkdir -p /home/runner/.cache/sccache && \
     # Copy SSH config to runner user
     mkdir -p /home/runner/.ssh && \
     cp /root/.ssh/known_hosts /home/runner/.ssh/ && \

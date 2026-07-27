@@ -1,39 +1,76 @@
+# Replicas are declared explicitly rather than via `deploy.replicas` because
+# every replica of a scaled service shares one set of volumes. sccache keeps an
+# in-memory LRU index per server process, so pointing several containers at one
+# cache directory lets them evict against each other and corrupt it. Each runner
+# therefore needs its OWN sccache volume, which requires its own service.
+#
+# The crate registry is different: cargo locks it, so a single shared volume is
+# safe and avoids N copies of the same downloads.
+#
+# `docker compose up -d --build` starts all 8. To run fewer, name them:
+#   docker compose up -d --build runner-1 runner-2 runner-3
+x-runner: &runner
+  build: .
+  restart: on-failure:5
+  stop_grace_period: 5m
+  environment:
+    URL: ${URL}
+    GITHUB_PAT: ${GITHUB_PAT}
+    RUNNER_TOKEN: ${RUNNER_TOKEN}
+    RUNNER_NAME: ${RUNNER_NAME}
+    # firmware_ci.yml targets `runs-on: labels: [fw-builder]`, so a runner
+    # without this label is registered but never assigned any job.
+    RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder}
+    # Match cargo's internal parallelism to this replica's CPU allotment.
+    # cargo defaults to one codegen unit per *host* core, so without this each
+    # replica would spawn ~16 threads and 8 replicas would oversubscribe the
+    # machine 8-fold. The cpus limit below only throttles the result; capping
+    # the thread count is what actually avoids the thrashing.
+    CARGO_BUILD_JOBS: ${RUNNER_CPUS:-2}
+  deploy:
+    resources:
+      limits:
+        # Sized for a 16-core / 64 GB host. Memory is the binding constraint,
+        # not CPU: 8 x 6g = 48 GB of the ~58 GB the VM exposes, leaving
+        # headroom for the host. CPUs are deliberately oversubscribed 1:1
+        # (8 x 2 = 16) because jobs spend much of their wall time on network
+        # and link steps rather than pegged compute.
+        cpus: ${RUNNER_CPUS:-2}
+        memory: ${RUNNER_MEMORY:-6g}
+
 services:
-  github-runner:
-    build: .
-    restart: on-failure:5
-    stop_grace_period: 5m
-    environment:
-      URL: ${URL}
-      GITHUB_PAT: ${GITHUB_PAT}
-      RUNNER_TOKEN: ${RUNNER_TOKEN}
-      RUNNER_NAME: ${RUNNER_NAME}
-      # firmware_ci.yml targets `runs-on: labels: [fw-builder]`, so a runner
-      # without this label is registered but never assigned any job.
-      RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder}
-      # Match cargo's internal parallelism to this replica's CPU allotment.
-      # cargo defaults to one codegen unit per *host* core, so without this each
-      # replica would spawn ~16 threads and N replicas would oversubscribe the
-      # machine N-fold. The cpus limit below only throttles the result; capping
-      # the thread count is what actually avoids the thrashing.
-      CARGO_BUILD_JOBS: ${RUNNER_CPUS:-2}
-    volumes:
-      # Shared crate download cache. Only the registry is shared, not the whole
-      # CARGO_HOME: cargo locks this directory, so concurrent replicas are safe,
-      # whereas a shared target/ dir would race. Without this every replica
-      # re-downloads the full dependency set on a cold start.
-      - cargo-registry:/home/runner/.cargo/registry
-    deploy:
-      replicas: ${RUNNER_COUNT:-8}
-      resources:
-        limits:
-          # Sized for a 16-core / 64 GB host. Memory is the binding constraint,
-          # not CPU: 8 x 6g = 48 GB of the ~58 GB the VM exposes, leaving
-          # headroom for the host. CPUs are deliberately oversubscribed 1:1
-          # (8 x 2 = 16) because jobs spend much of their wall time on network
-          # and link steps rather than pegged compute.
-          cpus: ${RUNNER_CPUS:-2}
-          memory: ${RUNNER_MEMORY:-6g}
+  runner-1:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-1:/home/runner/.cache/sccache]
+  runner-2:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-2:/home/runner/.cache/sccache]
+  runner-3:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-3:/home/runner/.cache/sccache]
+  runner-4:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-4:/home/runner/.cache/sccache]
+  runner-5:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-5:/home/runner/.cache/sccache]
+  runner-6:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-6:/home/runner/.cache/sccache]
+  runner-7:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-7:/home/runner/.cache/sccache]
+  runner-8:
+    <<: *runner
+    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-8:/home/runner/.cache/sccache]
 
 volumes:
   cargo-registry:
+  sccache-1:
+  sccache-2:
+  sccache-3:
+  sccache-4:
+  sccache-5:
+  sccache-6:
+  sccache-7:
+  sccache-8:

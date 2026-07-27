@@ -18,13 +18,15 @@ FULL_RUNNER_NAME="${RUNNER_NAME}-${HOSTNAME}"
 echo "Fixing permissions for /actions-runner..."
 chown -R runner:runner /actions-runner
 
-# The shared cargo registry is a named volume. Docker seeds it from the image
-# with the right ownership, but a volume created before that directory existed
-# (or by another image) comes back root-owned and silently breaks every build.
-if [[ -d /home/runner/.cargo/registry ]] && [[ "$(stat -c %U /home/runner/.cargo/registry)" != "runner" ]]; then
-  echo "Fixing permissions for the shared cargo registry..."
-  chown -R runner:runner /home/runner/.cargo/registry
-fi
+# These are named volumes. Docker seeds them from the image with the right
+# ownership, but a volume created before the directory existed in the image (or
+# by another image) comes back root-owned and silently breaks every build.
+for vol_dir in /home/runner/.cargo/registry /home/runner/.cache/sccache; do
+  if [[ -d "$vol_dir" ]] && [[ "$(stat -c %U "$vol_dir")" != "runner" ]]; then
+    echo "Fixing permissions for ${vol_dir}..."
+    chown -R runner:runner "$vol_dir"
+  fi
+done
 
 # Fetches a short-lived token ($1: "registration-token" or "remove-token") from the
 # GitHub API, using GITHUB_PAT. Prints the token on stdout, returns non-zero on failure.
