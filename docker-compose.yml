@@ -8,7 +8,9 @@ services:
       GITHUB_PAT: ${GITHUB_PAT}
       RUNNER_TOKEN: ${RUNNER_TOKEN}
       RUNNER_NAME: ${RUNNER_NAME}
-      RUNNER_LABELS: ${RUNNER_LABELS}
+      # firmware_ci.yml targets `runs-on: labels: [fw-builder]`, so a runner
+      # without this label is registered but never assigned any job.
+      RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder}
       # Match cargo's internal parallelism to this replica's CPU allotment.
       # cargo defaults to one codegen unit per *host* core, so without this each
       # replica would spawn ~16 threads and N replicas would oversubscribe the
