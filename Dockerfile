@@ -3,6 +3,13 @@ FROM ubuntu:24.04
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Populated by BuildKit with "amd64" or "arm64". Must be declared WITHOUT a
+# default: a default shadows the value the builder injects, which would silently
+# fetch the wrong architecture's binaries. Steps below fall back to
+# `dpkg --print-architecture` (same amd64/arm64 vocabulary) when it is unset,
+# so non-BuildKit builds still resolve the host architecture correctly.
+ARG TARGETARCH
+
 # ============================================================================
 # Base system dependencies (GitHub Actions Runner)
 # ============================================================================
@@ -55,7 +62,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 # ============================================================================
 # Install Pkl (Apple's configuration language - used by canvas)
 # ============================================================================
-RUN curl -L -o /usr/local/bin/pkl https://github.com/apple/pkl/releases/download/0.30.1/pkl-linux-amd64 && \
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) PKL_ARCH=amd64 ;; \
+        arm64) PKL_ARCH=aarch64 ;; \
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.30.1/pkl-linux-${PKL_ARCH}" && \
     chmod +x /usr/local/bin/pkl
 
 # ============================================================================
@@ -75,13 +88,19 @@ ENV PATH="/root/.local/bin:${PATH}"
 RUN mkdir -p /actions-runner
 WORKDIR /actions-runner
 
-RUN LATEST_TAG=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name) && \
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) RUNNER_ARCH=x64 ;; \
+        arm64) RUNNER_ARCH=arm64 ;; \
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    LATEST_TAG=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name) && \
     RUNNER_VERSION=${LATEST_TAG#v} && \
-    echo "Downloading Runner Version: ${RUNNER_VERSION}" && \
-    curl -L -o actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz \
-        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" && \
-    tar xzf actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz && \
-    rm actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
+    echo "Downloading Runner Version: ${RUNNER_VERSION} (${RUNNER_ARCH})" && \
+    curl -fL -o runner.tar.gz \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" && \
+    tar xzf runner.tar.gz && \
+    rm runner.tar.gz
 
 # ============================================================================
 # Setup SSH for private repository access (submodules)

@@ -29,6 +29,23 @@ This runner includes all tools required for the firmware CI pipeline:
 - **SSH** - Pre-configured with GitHub's host keys for private submodule access
 - Standard build essentials (`build-essential`, `pkg-config`, `libssl-dev`)
 
+## Architectures
+
+The image builds for both `linux/amd64` and `linux/arm64` (e.g. Apple Silicon via
+OrbStack/Docker Desktop). Architecture-specific downloads (GitHub Actions runner,
+Pkl) are selected from BuildKit's `TARGETARCH`; the Rust, ESP (`espup`) and Python
+toolchains resolve their own host architecture.
+
+Docker Compose and `docker build` produce a native image by default. To build
+explicitly for one architecture:
+
+```bash
+docker buildx build --platform linux/arm64 -t github-runner .
+```
+
+> Note: if `TARGETARCH` is unset (a build without BuildKit), the Dockerfile falls
+> back to `dpkg --print-architecture`, i.e. the base image's own architecture.
+
 ## Usage
 
 ### Environment Variables
