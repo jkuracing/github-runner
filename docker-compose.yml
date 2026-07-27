@@ -1,11 +1,21 @@
 # Replicas are declared explicitly rather than via `deploy.replicas` because
-# every replica of a scaled service shares one set of volumes. sccache keeps an
-# in-memory LRU index per server process, so pointing several containers at one
-# cache directory lets them evict against each other and corrupt it. Each runner
-# therefore needs its OWN sccache volume, which requires its own service.
+# every replica of a scaled service shares one set of volumes, and NOTHING here
+# is safe to share between concurrently building runners:
 #
-# The crate registry is different: cargo locks it, so a single shared volume is
-# safe and avoids N copies of the same downloads.
+#   - sccache keeps its LRU index in memory per server process, so several
+#     containers on one cache directory evict against each other.
+#   - The cargo registry was shared here initially and caused real CI failures:
+#       error: could not compile `crc32fast` (lib)
+#       Caused by: could not execute process `.../bin/rustc --crate-name
+#         crc32fast .../registry/src/index.crates.io-*/crc32fast-1.5.0/src/lib.rs`
+#       Caused by: No such file or directory (os error 2)
+#     Unpacked sources under registry/src vanish mid-compile when another
+#     container's cargo garbage-collects the global cache, so the spawn fails on
+#     a working directory that no longer exists. Cargo's package-cache lock does
+#     not protect a build for its whole duration across separate containers.
+#
+# Each runner therefore gets its own registry AND sccache volume, which is only
+# expressible as its own service. The cost is N copies of the crate downloads.
 #
 # `docker compose up -d --build` starts all 8. To run fewer, name them:
 #   docker compose up -d --build runner-1 runner-2 runner-3
@@ -41,31 +51,38 @@ x-runner: &runner
 services:
   runner-1:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-1:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-1:/home/runner/.cargo/registry, sccache-1:/home/runner/.cache/sccache]
   runner-2:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-2:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-2:/home/runner/.cargo/registry, sccache-2:/home/runner/.cache/sccache]
   runner-3:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-3:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-3:/home/runner/.cargo/registry, sccache-3:/home/runner/.cache/sccache]
   runner-4:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-4:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-4:/home/runner/.cargo/registry, sccache-4:/home/runner/.cache/sccache]
   runner-5:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-5:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-5:/home/runner/.cargo/registry, sccache-5:/home/runner/.cache/sccache]
   runner-6:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-6:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-6:/home/runner/.cargo/registry, sccache-6:/home/runner/.cache/sccache]
   runner-7:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-7:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-7:/home/runner/.cargo/registry, sccache-7:/home/runner/.cache/sccache]
   runner-8:
     <<: *runner
-    volumes: [cargo-registry:/home/runner/.cargo/registry, sccache-8:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-8:/home/runner/.cargo/registry, sccache-8:/home/runner/.cache/sccache]
 
 volumes:
-  cargo-registry:
+  cargo-registry-1:
+  cargo-registry-2:
+  cargo-registry-3:
+  cargo-registry-4:
+  cargo-registry-5:
+  cargo-registry-6:
+  cargo-registry-7:
+  cargo-registry-8:
   sccache-1:
   sccache-2:
   sccache-3:

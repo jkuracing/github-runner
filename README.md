@@ -93,14 +93,19 @@ RUNNER_CPUS=4 RUNNER_MEMORY=10g docker compose up -d --build
 
 ### Caching
 
-Two caches survive container recreation:
+Two caches survive container recreation, both **per replica**:
 
-- **`cargo-registry`** — shared by all replicas. Crates are downloaded once
-  rather than once per runner. Sharing is safe because cargo locks the registry.
-- **`sccache-N`** — one volume *per replica*. `setup-rust-dual` in the firmware
-  repo points sccache at `$HOME/.cache/sccache`, and sccache keeps an in-memory
-  LRU index per server process, so several containers sharing one cache
-  directory would evict against each other and corrupt it.
+- **`cargo-registry-N`** — the crate download cache.
+- **`sccache-N`** — the compiler cache. `setup-rust-dual` in the firmware repo
+  points sccache at `$HOME/.cache/sccache`.
+
+Neither may be shared between replicas. sccache keeps its LRU index in memory
+per server process, so containers sharing one directory evict against each
+other. The registry was shared in an earlier revision and broke CI: unpacked
+sources under `registry/src` disappear mid-compile when another container's
+cargo garbage-collects the global cache, producing
+`could not execute process ... No such file or directory`. The cost of not
+sharing is N copies of the same crate downloads, which is the right trade.
 
 The runner's `_work` directory is deliberately **not** persisted. The firmware
 workflow checks out with `clean: false` to reuse `target/`, but a stale
