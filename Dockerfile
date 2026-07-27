@@ -74,13 +74,15 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # ============================================================================
 # Install uv (fast Python package manager) and maturin (Rust-Python build tool)
 # ============================================================================
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    # Add uv to PATH
-    . $HOME/.local/bin/env && \
-    # Install maturin globally via uv
-    uv tool install maturin
+# Installed into shared, world-readable locations rather than under /root, which
+# is mode 0700: a tool symlinked out of /root is unusable by the unprivileged
+# runner user that actually executes jobs.
+ENV UV_TOOL_DIR=/opt/uv/tools
 
-ENV PATH="/root/.local/bin:${PATH}"
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh && \
+    # Install maturin globally, with its launcher on the shared PATH
+    UV_TOOL_BIN_DIR=/usr/local/bin uv tool install maturin && \
+    chmod -R a+rX /opt/uv
 
 # ============================================================================
 # Create runner directory and download GitHub Actions Runner
@@ -124,9 +126,8 @@ RUN useradd -m runner && \
     cp -r /root/.rustup/* /home/runner/.rustup/ 2>/dev/null || true && \
     # Copy export-esp.sh to runner home
     cp /root/export-esp.sh /home/runner/export-esp.sh 2>/dev/null || true && \
-    # Copy uv and tools to runner user
-    mkdir -p /home/runner/.local && \
-    cp -r /root/.local/* /home/runner/.local/ 2>/dev/null || true && \
+    # uv and its tools (maturin) live in /usr/local/bin and /opt/uv, which are
+    # already on the shared PATH and readable by this user — nothing to copy.
     # Copy SSH config to runner user
     mkdir -p /home/runner/.ssh && \
     cp /root/.ssh/known_hosts /home/runner/.ssh/ && \
