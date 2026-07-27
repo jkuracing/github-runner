@@ -57,6 +57,35 @@ docker buildx build --platform linux/arm64 -t github-runner .
 | `RUNNER_TOKEN` | One of `GITHUB_PAT` / `RUNNER_TOKEN` | Static runner registration token from GitHub. Expires ~1 hour after creation, so restarts after that will fail unless refreshed. Ignored if `GITHUB_PAT` is set. |
 | `RUNNER_NAME` | No | Base name for the runner (default: `runner`) |
 | `RUNNER_LABELS` | No | Comma-separated labels for the runner |
+| `RUNNER_COUNT` | No | Number of runner replicas (default: `4`) |
+| `RUNNER_CPUS` | No | CPUs per replica; also caps `CARGO_BUILD_JOBS` (default: `4`) |
+| `RUNNER_MEMORY` | No | Memory per replica (default: `10g`) |
+
+### Parallel Jobs
+
+A GitHub Actions runner executes **one job at a time** — there is no concurrency
+setting inside the runner. Total parallelism is therefore just `RUNNER_COUNT`.
+
+The defaults (4 replicas x 4 CPUs x 10 GB) target a 16-core / 64 GB host. Each
+replica gets a hard CPU and memory limit, and `CARGO_BUILD_JOBS` is pinned to
+`RUNNER_CPUS` — without that, cargo sizes its thread pool from the *host* core
+count and every replica would spawn ~16 threads, oversubscribing the machine.
+
+Raising `RUNNER_COUNT` past the core count trades per-job latency for throughput:
+8 replicas x 2 CPUs runs twice as many jobs, but each Rust build is much slower.
+Prefer more replicas only if your jobs are mostly light (fmt, clippy, tests)
+rather than full firmware builds.
+
+```bash
+RUNNER_COUNT=8 RUNNER_CPUS=2 RUNNER_MEMORY=6g docker compose up -d --build
+```
+
+### Caching
+
+Replicas share a `cargo-registry` volume, so crates are downloaded once rather
+than once per replica. Only the registry is shared — cargo locks it, making
+concurrent access safe, whereas a shared `target/` directory would race.
+Build artifacts are **not** shared or persisted across `docker compose down`.
 
 ### Running with Docker Compose
 
@@ -65,6 +94,10 @@ docker buildx build --platform linux/arm64 -t github-runner .
 export URL=https://github.com/jkuracing
 export GITHUB_PAT=<your-pat>
 
-# Start the runner
-docker compose up -d
+# Start the runners
+docker compose up -d --build
 ```
+
+> Always pass `--build`. Plain `docker compose up -d` only builds when the image
+> is missing, so it will happily keep running a stale image after the Dockerfile
+> or `entrypoint.sh` changes.

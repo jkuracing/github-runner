@@ -9,8 +9,26 @@ services:
       RUNNER_TOKEN: ${RUNNER_TOKEN}
       RUNNER_NAME: ${RUNNER_NAME}
       RUNNER_LABELS: ${RUNNER_LABELS}
+      # Match cargo's internal parallelism to this replica's CPU allotment.
+      # cargo defaults to one codegen unit per *host* core, so without this each
+      # replica would spawn ~16 threads and N replicas would oversubscribe the
+      # machine N-fold. The cpus limit below only throttles the result; capping
+      # the thread count is what actually avoids the thrashing.
+      CARGO_BUILD_JOBS: ${RUNNER_CPUS:-4}
+    volumes:
+      # Shared crate download cache. Only the registry is shared, not the whole
+      # CARGO_HOME: cargo locks this directory, so concurrent replicas are safe,
+      # whereas a shared target/ dir would race. Without this every replica
+      # re-downloads the full dependency set on a cold start.
+      - cargo-registry:/home/runner/.cargo/registry
     deploy:
-      replicas: ${RUNNER_COUNT:-1}
+      replicas: ${RUNNER_COUNT:-4}
+      resources:
+        limits:
+          # Sized for a 16-core / 64 GB host, leaving headroom for macOS itself.
+          # 4 x 4 CPUs saturates the machine without oversubscribing it.
+          cpus: ${RUNNER_CPUS:-4}
+          memory: ${RUNNER_MEMORY:-10g}
 
 volumes:
-  runner-data:
+  cargo-registry:
