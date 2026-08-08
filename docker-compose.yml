@@ -21,13 +21,24 @@
 #   docker compose up -d --build runner-1 runner-2 runner-3
 x-runner: &runner
   build: .
-  restart: on-failure:5
+  # `on-failure:5` used to be the policy here and it cost the fleet ten days of
+  # downtime: a bug in entrypoint.sh's config cleanup made every replica exit 1
+  # on restart, the five retries were spent in seconds, and Docker then left all
+  # eight containers dead with no surviving process to notice. A runner fleet
+  # should heal rather than latch off, and the entrypoint mints a fresh
+  # registration token per start, so a genuinely broken image loops visibly in
+  # the logs instead of failing silently.
+  restart: unless-stopped
   stop_grace_period: 5m
   environment:
     URL: ${URL}
     GITHUB_PAT: ${GITHUB_PAT}
-    RUNNER_TOKEN: ${RUNNER_TOKEN}
-    RUNNER_NAME: ${RUNNER_NAME}
+    # Defaulted to empty: entrypoint.sh prefers GITHUB_PAT and only falls back
+    # to a static token, but an unset variable makes `docker compose` print a
+    # warning per service per invocation -- 16 lines of noise that bury the
+    # real errors underneath.
+    RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+    RUNNER_NAME: ${RUNNER_NAME:-}
     # firmware_ci.yml targets `runs-on: labels: [fw-builder]`, so a runner
     # without this label is registered but never assigned any job.
     RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder}

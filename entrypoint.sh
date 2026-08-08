@@ -81,8 +81,24 @@ if [[ -f /home/runner/export-esp.sh ]]; then
 fi
 
 echo "Removing any existing runner configuration..."
-# Clean up previous runs (crucial for ephemeral runners)
-rm -f .runner .credentials .credentials_rsaparams
+# Clean up previous runs (crucial for ephemeral runners).
+#
+# `.runner_migrated` MUST be in this list. The runner self-updates in place, and
+# a post-update runner drops that marker beside its config. `config.sh` treats
+# the marker ALONE as proof the runner is already configured -- verified by
+# creating only `.runner_migrated` and passing a deliberately bogus token: it
+# fails with "Cannot configure the runner because it is already configured"
+# without even attempting to authenticate.
+#
+# Because the old list stopped at `.credentials_rsaparams`, every replica that
+# had auto-updated crash-looped on its next restart until `restart:
+# on-failure:5` exhausted its retries, which silently took the entire fleet
+# offline about ten days after it was last rebuilt. Deleting the marker is
+# correct rather than merely expedient: this entrypoint always reconfigures from
+# a freshly minted registration token, so there is no migrated state worth
+# preserving across a restart.
+rm -f .runner .credentials .credentials_rsaparams \
+      .runner_migrated .credentials_migrated
 
 echo "Configuring GitHub Actions Runner as ${FULL_RUNNER_NAME}..."
 echo "URL: $URL"
