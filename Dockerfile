@@ -85,6 +85,35 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
     chmod -R a+rX /opt/uv
 
 # ============================================================================
+# Web UI and Tauri desktop dependencies (hbf)
+# ============================================================================
+# Deliberately placed AFTER the espup layer. Docker invalidates every layer
+# below an edited one, and rebuilding the Xtensa toolchain costs many minutes,
+# so anything added later must stay later.
+#
+# `cargo build -p hbf-gui` links against webkit2gtk-4.1 and fails at
+# pkg-config time without the -dev package; librsvg2 and appindicator3 are
+# Tauri's SVG and tray-icon dependencies. This mirrors the apt list hbf CI
+# installs per job, minus what the firmware layers above already provide
+# (libudev-dev, pkg-config, libssl-dev).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+        librsvg2-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# bun builds the SvelteKit bundle that `tauri::generate_context!()` embeds at
+# COMPILE time, so it is a build dependency of hbf-gui rather than a test-only
+# tool. Pinned to the version hbf CI's `oven-sh/setup-bun` requests so lockfile
+# resolution is identical on both. BUN_INSTALL places the binary on the shared
+# PATH instead of under /root, which is mode 0700 and therefore invisible to the
+# unprivileged runner user -- the same trap the uv block above documents.
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" && \
+    chmod a+rx /usr/local/bin/bun && \
+    bun --version
+
+# ============================================================================
 # Create runner directory and download GitHub Actions Runner
 # ============================================================================
 RUN mkdir -p /actions-runner

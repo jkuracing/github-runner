@@ -39,9 +39,13 @@ x-runner: &runner
     # real errors underneath.
     RUNNER_TOKEN: ${RUNNER_TOKEN:-}
     RUNNER_NAME: ${RUNNER_NAME:-}
-    # firmware_ci.yml targets `runs-on: labels: [fw-builder]`, so a runner
-    # without this label is registered but never assigned any job.
-    RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder}
+    # A runner is offered a job only when its label set is a SUPERSET of the
+    # job's `runs-on`. Both labels therefore go on every replica: splitting them
+    # across replicas (say 1-6 fw-builder, 7-8 hbf-builder) would leave six
+    # containers ineligible for hbf jobs and idle whenever hbf work is all that
+    # is queued. firmware_ci.yml asks for [fw-builder]; hbf asks for
+    # [hbf-builder]; every replica can serve either.
+    RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder,hbf-builder}
     # Match cargo's internal parallelism to this replica's CPU allotment.
     # cargo defaults to one codegen unit per *host* core, so without this each
     # replica would spawn ~16 threads and 8 replicas would oversubscribe the
