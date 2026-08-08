@@ -17,14 +17,20 @@
 # Each runner therefore gets its own registry AND sccache volume, which is only
 # expressible as its own service. The cost is N copies of the crate downloads.
 #
-# `docker compose up -d --build` starts all 8. To run fewer, name them:
+# `docker compose up -d --build` starts all 12. To run fewer, name them:
 #   docker compose up -d --build runner-1 runner-2 runner-3
+#
+# `docker compose build` MUST be run with no service argument. Each service
+# declares its own `build: .`, so compose tags a separate image per service, and
+# `docker compose build runner-1` silently leaves the others on the old image --
+# they still start and register, so nothing looks wrong until a job needs a tool
+# only the rebuilt image has.
 x-runner: &runner
   build: .
   # `on-failure:5` used to be the policy here and it cost the fleet ten days of
   # downtime: a bug in entrypoint.sh's config cleanup made every replica exit 1
   # on restart, the five retries were spent in seconds, and Docker then left all
-  # eight containers dead with no surviving process to notice. A runner fleet
+  # containers dead with no surviving process to notice. A runner fleet
   # should heal rather than latch off, and the entrypoint mints a fresh
   # registration token per start, so a genuinely broken image loops visibly in
   # the logs instead of failing silently.
@@ -35,33 +41,48 @@ x-runner: &runner
     GITHUB_PAT: ${GITHUB_PAT}
     # Defaulted to empty: entrypoint.sh prefers GITHUB_PAT and only falls back
     # to a static token, but an unset variable makes `docker compose` print a
-    # warning per service per invocation -- 16 lines of noise that bury the
-    # real errors underneath.
+    # warning per service per invocation -- noise that buries the real errors
+    # underneath.
     RUNNER_TOKEN: ${RUNNER_TOKEN:-}
     RUNNER_NAME: ${RUNNER_NAME:-}
     # A runner is offered a job only when its label set is a SUPERSET of the
     # job's `runs-on`. Both labels therefore go on every replica: splitting them
-    # across replicas (say 1-6 fw-builder, 7-8 hbf-builder) would leave six
-    # containers ineligible for hbf jobs and idle whenever hbf work is all that
-    # is queued. firmware_ci.yml asks for [fw-builder]; hbf asks for
-    # [hbf-builder]; every replica can serve either.
+    # across replicas would leave some containers ineligible for hbf jobs and
+    # idle whenever hbf work is all that is queued. firmware_ci.yml asks for
+    # [fw-builder]; hbf asks for [hbf-builder]; every replica can serve either.
     RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder,hbf-builder}
     # Match cargo's internal parallelism to this replica's CPU allotment.
     # cargo defaults to one codegen unit per *host* core, so without this each
-    # replica would spawn ~16 threads and 8 replicas would oversubscribe the
-    # machine 8-fold. The cpus limit below only throttles the result; capping
-    # the thread count is what actually avoids the thrashing.
+    # replica would spawn ~16 threads and every replica would oversubscribe the
+    # machine. The cpus limit below only throttles the result; capping the thread
+    # count is what actually avoids the thrashing.
     CARGO_BUILD_JOBS: ${RUNNER_CPUS:-2}
   deploy:
     resources:
       limits:
-        # Sized for a 16-core / 64 GB host. Memory is the binding constraint,
-        # not CPU: 8 x 6g = 48 GB of the ~58 GB the VM exposes, leaving
-        # headroom for the host. CPUs are deliberately oversubscribed 1:1
-        # (8 x 2 = 16) because jobs spend much of their wall time on network
-        # and link steps rather than pegged compute.
+        # 12 replicas at 2 CPU / 4 GB on a 16-core / 64 GB host.
+        #
+        # This block previously read "Memory is the binding constraint, not CPU"
+        # at 8 x 6 GB. Measured under a full load of firmware and hbf jobs, that
+        # was wrong on both counts: peak usage across all replicas was 756 MiB
+        # against the 6 GiB limit -- an 8x overshoot -- and only 4 of 8
+        # containers were computing at all (~195% CPU each), the rest sitting
+        # near idle on network and setup. Roughly half the host's cores were
+        # unused while jobs queued.
+        #
+        # The real constraint was SLOTS. An hbf run measured 16.8 minutes of job
+        # time inside an 11.8 minute span -- an average concurrency of 1.4 --
+        # because firmware held 7 of the 8 slots. So: more, smaller replicas.
+        #
+        # Total memory is unchanged at 48 GB of the ~58 GB the VM exposes. CPU is
+        # deliberately oversubscribed 1.5:1 (12 x 2 = 24 on 16 cores), which the
+        # observed idle time justifies.
+        #
+        # DISK is now the limiting factor, not memory: each replica keeps its own
+        # target/ for both repositories on one 200 GB volume, which was 47% full
+        # at 8 replicas. Watch `docker system df` before going wider.
         cpus: ${RUNNER_CPUS:-2}
-        memory: ${RUNNER_MEMORY:-6g}
+        memory: ${RUNNER_MEMORY:-4g}
 
 services:
   runner-1:
@@ -88,6 +109,18 @@ services:
   runner-8:
     <<: *runner
     volumes: [cargo-registry-8:/home/runner/.cargo/registry, sccache-8:/home/runner/.cache/sccache]
+  runner-9:
+    <<: *runner
+    volumes: [cargo-registry-9:/home/runner/.cargo/registry, sccache-9:/home/runner/.cache/sccache]
+  runner-10:
+    <<: *runner
+    volumes: [cargo-registry-10:/home/runner/.cargo/registry, sccache-10:/home/runner/.cache/sccache]
+  runner-11:
+    <<: *runner
+    volumes: [cargo-registry-11:/home/runner/.cargo/registry, sccache-11:/home/runner/.cache/sccache]
+  runner-12:
+    <<: *runner
+    volumes: [cargo-registry-12:/home/runner/.cargo/registry, sccache-12:/home/runner/.cache/sccache]
 
 volumes:
   cargo-registry-1:
@@ -98,6 +131,10 @@ volumes:
   cargo-registry-6:
   cargo-registry-7:
   cargo-registry-8:
+  cargo-registry-9:
+  cargo-registry-10:
+  cargo-registry-11:
+  cargo-registry-12:
   sccache-1:
   sccache-2:
   sccache-3:
@@ -106,3 +143,7 @@ volumes:
   sccache-6:
   sccache-7:
   sccache-8:
+  sccache-9:
+  sccache-10:
+  sccache-11:
+  sccache-12:
