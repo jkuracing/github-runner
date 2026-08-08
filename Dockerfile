@@ -102,6 +102,24 @@ RUN apt-get update && \
         librsvg2-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Node is needed even though bun is the package manager, because bun does not
+# replace it as a script *interpreter*. hbf's `ts_export` test execs
+# `ui/node_modules/.bin/prettier` directly from Rust; that file is a .cjs script
+# whose shebang is `#!/usr/bin/env node`, so without node the exec fails with
+# status 127 and the drift check reports "bindings would drift". `bun run lint`
+# and `bun run check` are unaffected because `bun run` interprets the JS itself
+# and never consults the shebang -- which is exactly why this gap is invisible
+# until something shells out to a .bin entry.
+#
+# npm comes along for `npx`, which the same test falls back to when the
+# project-local binary is absent. GitHub-hosted runners preinstall both, which is
+# why this only surfaced on the fleet.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nodejs npm && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    node --version && npx --version
+
 # bun builds the SvelteKit bundle that `tauri::generate_context!()` embeds at
 # COMPILE time, so it is a build dependency of hbf-gui rather than a test-only
 # tool. Pinned to the version hbf CI's `oven-sh/setup-bun` requests so lockfile
