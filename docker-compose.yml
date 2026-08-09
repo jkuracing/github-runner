@@ -3,7 +3,9 @@
 # is safe to share between concurrently building runners:
 #
 #   - sccache keeps its LRU index in memory per server process, so several
-#     containers on one cache directory evict against each other.
+#     containers on one cache DIRECTORY evict against each other. This is why
+#     the shared sccache below is reached over S3 instead: a server backend has
+#     no such per-process index, so sharing it is safe where a directory is not.
 #   - The cargo registry was shared here initially and caused real CI failures:
 #       error: could not compile `crc32fast` (lib)
 #       Caused by: could not execute process `.../bin/rustc --crate-name
@@ -14,8 +16,14 @@
 #     a working directory that no longer exists. Cargo's package-cache lock does
 #     not protect a build for its whole duration across separate containers.
 #
-# Each runner therefore gets its own registry AND sccache volume, which is only
+# Each runner therefore gets its own cargo registry volume, which is only
 # expressible as its own service. The cost is N copies of the crate downloads.
+#
+# sccache is the exception and is now SHARED, via the `sccache-s3` service below.
+# Twelve private caches would each have to warm from scratch, so the first build
+# on every replica stayed cold -- most of what a cache exists to prevent. The
+# per-replica sccache volumes that used to be mounted here are gone: with an S3
+# backend sccache keeps no local cache directory.
 #
 # `docker compose up -d --build` starts all 12. To run fewer, name them:
 #   docker compose up -d --build runner-1 runner-2 runner-3
@@ -36,6 +44,12 @@ x-runner: &runner
   # the logs instead of failing silently.
   restart: unless-stopped
   stop_grace_period: 5m
+  # Ordering only, deliberately NOT `condition: service_healthy`. Gating twelve
+  # runners on the cache's health would turn an optimisation into a single point
+  # of failure for the whole fleet -- a sick MinIO would mean no CI at all rather
+  # than slow CI. entrypoint.sh probes the bucket itself and degrades to
+  # wrapper-less builds if it cannot be reached.
+  depends_on: [sccache-s3]
   environment:
     URL: ${URL}
     GITHUB_PAT: ${GITHUB_PAT}
@@ -82,21 +96,21 @@ x-runner: &runner
     # hosted runners and developer laptops unaffected. Neither repo sets
     # CARGO_INCREMENTAL, so the fleet's value is what a job sees.
     #
-    # NOTE: sccache is currently DEAD here, which is why wiping a target/ dir
-    # is a genuinely cold rebuild rather than a cheap one. The binary is not in
-    # the image at all (`sccache --version` -> not found), no RUSTC_WRAPPER is
-    # ever set, and the newest entry in the 1.1 GB-per-replica cache volumes
-    # dates to 2026-07-28 -- an abandoned experiment holding ~13 GB fleet-wide.
+    # sccache was DEAD here until 2026-08-09 -- absent from the image, no
+    # RUSTC_WRAPPER ever set, and 1.1 GB per replica of cache last written
+    # 2026-07-28. That is why wiping a target/ dir used to mean a genuinely cold
+    # rebuild. It is now installed in the image and wired to the shared bucket by
+    # entrypoint.sh, which enables the wrapper only if that bucket answers, so a
+    # cache outage degrades build speed instead of failing CI.
     #
-    # Wiring it up properly is the real fix for the 12x target/ duplication:
-    # sccache keys per-crate rustc output on content in a store OUTSIDE
-    # target/, which is what makes target/ disposable. Note CARGO_INCREMENTAL=0
-    # above is a PREREQUISITE, not a conflict -- sccache cannot cache
-    # incrementally compiled units and silently bypasses them. Unlike the cargo
-    # registry (see the header comment for why sharing that corrupts builds), a
-    # single sccache CAN be shared safely across all 12 replicas, but only via a
-    # server backend (redis/S3/webdav); a shared local directory is unsafe
-    # because each sccache server process keeps its own in-memory LRU index.
+    # CARGO_INCREMENTAL=0 is a PREREQUISITE for it, not a rival: sccache cannot
+    # cache incrementally compiled units and silently bypasses them.
+    #
+    # What sccache does NOT do is shrink target/ -- the rlibs and test
+    # executables still land there at full size, so a warm fleet returns to
+    # roughly 140 GB. It makes deleting those dirs cheap, which is what makes a
+    # recurring sweep affordable. Disk stays bounded by sccache AND the sweep
+    # together; neither suffices alone.
   deploy:
     resources:
       limits:
@@ -135,44 +149,103 @@ x-runner: &runner
         memory: ${RUNNER_MEMORY:-4g}
 
 services:
+  # The one cache all 12 replicas share. See the header comment for why this is
+  # S3 rather than a shared directory, and why the cargo registry deliberately is
+  # NOT shared the same way.
+  #
+  # MinIO is used in preference to Redis because a compilation cache of this size
+  # belongs on disk: Redis would hold the whole thing in RAM, and 48 of the VM's
+  # ~58 GB is already committed to the replicas, so it would compete with the
+  # builds it is meant to accelerate.
+  #
+  # Not published to the host. Only the runners need it, and the fleet's compose
+  # network is enough -- exposing an unauthenticated-by-default object store on a
+  # laptop's interfaces would be a poor trade for a build cache.
+  sccache-s3:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${SCCACHE_ACCESS_KEY:-sccache}
+      MINIO_ROOT_PASSWORD: ${SCCACHE_SECRET_KEY:-sccache-secret}
+    volumes: [sccache-s3-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Creates the bucket and, more importantly, BOUNDS it. sccache has a built-in
+  # LRU for a local cache directory (SCCACHE_CACHE_SIZE) but none whatsoever for
+  # an S3 backend -- it never deletes anything it uploads. Left alone this bucket
+  # would grow without limit and become the disk problem it was added to solve.
+  #
+  # Expiry by age rather than a hard quota is the primary bound: a hard quota
+  # makes writes start failing once reached, which sccache reports as errors on
+  # every miss, whereas expiry keeps the working set and simply forgets what has
+  # not been useful lately. 14 days comfortably covers a fortnight of branches
+  # while capping the bucket at roughly one fortnight of unique compilations.
+  # The quota is a generous backstop against a pathological week.
+  #
+  # Runs to completion and exits; `restart: "no"` keeps it from looping.
+  sccache-s3-init:
+    image: minio/mc:latest
+    depends_on:
+      sccache-s3:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set fleet http://sccache-s3:9000
+      '${SCCACHE_ACCESS_KEY:-sccache}' '${SCCACHE_SECRET_KEY:-sccache-secret}' &&
+      mc mb --ignore-existing fleet/sccache &&
+      mc ilm rule add --expire-days 14 fleet/sccache 2>/dev/null || true &&
+      mc quota set fleet/sccache --size ${SCCACHE_MAX_SIZE:-30GiB} 2>/dev/null || true &&
+      echo 'sccache bucket ready:' && mc du fleet/sccache
+      "
+
   runner-1:
     <<: *runner
-    volumes: [cargo-registry-1:/home/runner/.cargo/registry, sccache-1:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-1:/home/runner/.cargo/registry]
   runner-2:
     <<: *runner
-    volumes: [cargo-registry-2:/home/runner/.cargo/registry, sccache-2:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-2:/home/runner/.cargo/registry]
   runner-3:
     <<: *runner
-    volumes: [cargo-registry-3:/home/runner/.cargo/registry, sccache-3:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-3:/home/runner/.cargo/registry]
   runner-4:
     <<: *runner
-    volumes: [cargo-registry-4:/home/runner/.cargo/registry, sccache-4:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-4:/home/runner/.cargo/registry]
   runner-5:
     <<: *runner
-    volumes: [cargo-registry-5:/home/runner/.cargo/registry, sccache-5:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-5:/home/runner/.cargo/registry]
   runner-6:
     <<: *runner
-    volumes: [cargo-registry-6:/home/runner/.cargo/registry, sccache-6:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-6:/home/runner/.cargo/registry]
   runner-7:
     <<: *runner
-    volumes: [cargo-registry-7:/home/runner/.cargo/registry, sccache-7:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-7:/home/runner/.cargo/registry]
   runner-8:
     <<: *runner
-    volumes: [cargo-registry-8:/home/runner/.cargo/registry, sccache-8:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-8:/home/runner/.cargo/registry]
   runner-9:
     <<: *runner
-    volumes: [cargo-registry-9:/home/runner/.cargo/registry, sccache-9:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-9:/home/runner/.cargo/registry]
   runner-10:
     <<: *runner
-    volumes: [cargo-registry-10:/home/runner/.cargo/registry, sccache-10:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-10:/home/runner/.cargo/registry]
   runner-11:
     <<: *runner
-    volumes: [cargo-registry-11:/home/runner/.cargo/registry, sccache-11:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-11:/home/runner/.cargo/registry]
   runner-12:
     <<: *runner
-    volumes: [cargo-registry-12:/home/runner/.cargo/registry, sccache-12:/home/runner/.cache/sccache]
+    volumes: [cargo-registry-12:/home/runner/.cargo/registry]
 
 volumes:
+  # The single shared compilation cache, bounded by the ilm rule and quota that
+  # sccache-s3-init applies. Replaces the twelve per-replica sccache volumes.
+  sccache-s3-data:
   cargo-registry-1:
   cargo-registry-2:
   cargo-registry-3:
@@ -185,15 +258,3 @@ volumes:
   cargo-registry-10:
   cargo-registry-11:
   cargo-registry-12:
-  sccache-1:
-  sccache-2:
-  sccache-3:
-  sccache-4:
-  sccache-5:
-  sccache-6:
-  sccache-7:
-  sccache-8:
-  sccache-9:
-  sccache-10:
-  sccache-11:
-  sccache-12:

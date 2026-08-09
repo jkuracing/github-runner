@@ -159,6 +159,44 @@ RUN mkdir -p /root/.ssh && \
     ssh-keyscan github.com >> /root/.ssh/known_hosts && \
     chmod 644 /root/.ssh/known_hosts
 
+# ============================================================================
+# sccache -- shared compilation cache
+# ============================================================================
+# Placement is deliberate on both sides. It sits AFTER the espup and bun layers,
+# so adding it never invalidates the multi-GB Xtensa toolchain, and BEFORE
+# `COPY entrypoint.sh`, because that COPY invalidates every layer after it
+# whenever the entrypoint changes -- re-downloading sccache on each entrypoint
+# tweak would be pure waste.
+#
+# Why it exists: every replica keeps its own `target/`, and hbf's reaches
+# 11-13 GB, so twelve of them took a 926 GB volume down to 294 MB free on
+# 2026-08-09, at which point CI began failing with
+# `collect2: ld terminated with signal 7 [Bus error]` -- disk exhaustion wearing
+# a linker bug's clothing.
+#
+# sccache does NOT shrink `target/`. It caches rustc invocations in a store
+# outside it, so the rlibs and test executables still land there at full size.
+# What it buys is that DELETING a target dir becomes cheap, which is what makes
+# those dirs disposable rather than something to hoard. Bounding disk therefore
+# needs sccache AND a recurring sweep; sccache on its own does not do it.
+#
+# The musl build is static, so it is indifferent to the glibc version of whatever
+# base image this is rebuilt on.
+ARG SCCACHE_VERSION=v0.17.0
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) SCCACHE_ARCH=x86_64 ;; \
+        arm64) SCCACHE_ARCH=aarch64 ;; \
+        *) echo "ERROR: unsupported architecture for sccache: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    SCCACHE_PKG="sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl" && \
+    curl -fsSL -o /tmp/sccache.tar.gz \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${SCCACHE_PKG}.tar.gz" && \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp && \
+    install -m 0755 "/tmp/${SCCACHE_PKG}/sccache" /usr/local/bin/sccache && \
+    rm -rf /tmp/sccache.tar.gz "/tmp/${SCCACHE_PKG}" && \
+    sccache --version
+
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

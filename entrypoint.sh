@@ -206,7 +206,121 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 # only CARGO_PROFILE_RELEASE_DEBUG and leaves its dev profile uncovered.
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
 
-echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG}"
+# sccache, backed by the fleet's shared S3 (MinIO) bucket.
+#
+# Shared rather than per-replica on purpose. Twelve private caches would each
+# have to warm from scratch, so the first build on every replica stays cold --
+# which is most of what a cache is supposed to prevent. Pointed at one bucket,
+# whichever replica compiles a crate first serves the other eleven. Note the
+# per-replica *local* sccache volumes this fleet used to mount are unnecessary
+# in this mode and have been removed from docker-compose.yml: with an S3 backend
+# sccache does not use a local cache directory.
+#
+# A shared local DIRECTORY would not be safe here -- each sccache server process
+# keeps its own in-memory LRU index, so several containers writing one directory
+# corrupt each other's accounting. A server backend has no such problem, which
+# is the distinction the header comment in docker-compose.yml draws for the cargo
+# registry as well.
+SCCACHE_BUCKET="${SCCACHE_BUCKET:-sccache}"
+SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-http://sccache-s3:9000}"
+SCCACHE_REGION="${SCCACHE_REGION:-us-east-1}"
+AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-sccache}"
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-sccache-secret}"
+
+# Enable the wrapper ONLY if the bucket is actually reachable. A cache is an
+# optimisation and must never be able to break CI: if MinIO is down, mis-DNSed or
+# still starting, the correct outcome is slower builds, not failed ones. sccache
+# degrades gracefully once running, but a server that cannot start at all would
+# take every `cargo` invocation down with it, so this is checked up front rather
+# than hoped for. Retried because the runner and MinIO come up concurrently.
+# The window is generous (~60s) because compose only orders startup here and does
+# not wait for health -- see docker-compose.yml for why gating the fleet on the
+# cache would be worse. On a cold `up -d` MinIO may still be initialising its
+# volume while the runners boot, and a replica that gives up early would run
+# every job uncached until something restarted it.
+sccache_reachable=0
+for attempt in $(seq 1 20); do
+  if curl -fsS --max-time 3 "${SCCACHE_ENDPOINT}/minio/health/live" >/dev/null 2>&1; then
+    sccache_reachable=1
+    break
+  fi
+  echo "sccache: ${SCCACHE_ENDPOINT} not ready (attempt ${attempt}/20), retrying..."
+  sleep 3
+done
+
+if [[ "$sccache_reachable" == "1" ]]; then
+  export SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  export SCCACHE_S3_USE_SSL="${SCCACHE_S3_USE_SSL:-false}"
+  # Surfaces storage errors in the job log instead of silently degrading to a 0%
+  # hit rate, which is exactly how the previous sccache attempt here died
+  # unnoticed -- it left 1.1 GB per replica of cache last written 2026-07-28 and
+  # no wrapper ever configured.
+  export SCCACHE_ERROR_LOG=/tmp/sccache.log
+  export SCCACHE_LOG="${SCCACHE_LOG:-warn}"
+  export RUSTC_WRAPPER=sccache
+
+  # Start the server HERE, explicitly, and never let it idle out. Both halves are
+  # load-bearing, and this was found the hard way.
+  #
+  # The sccache server takes its cache configuration from whichever process first
+  # starts it. Started explicitly with the environment above it comes up on s3
+  # ("Cache location  s3, name: sccache"); left to be spawned implicitly by
+  # cargo's first `sccache rustc ...` wrapper call it came up on LOCAL DISK
+  # instead, reporting `Cache location  Local disk` with every compile request
+  # invisible to the shared bucket. That failure is silent -- builds succeed at
+  # full speed-looking cost, the bucket stays empty, and the only symptom is a
+  # cache that never hits. It is exactly the shape of the previous dead sccache
+  # attempt here, so it gets a real fix rather than a hope.
+  #
+  # SCCACHE_IDLE_TIMEOUT=0 keeps the server alive for the container's lifetime.
+  # The default is 600s, after which the server exits and the NEXT wrapper call
+  # respawns it -- landing back on local disk and silently unsharing the cache
+  # between jobs. A runner is idle far longer than ten minutes between jobs, so
+  # the default would have made this bug the normal case.
+  export SCCACHE_IDLE_TIMEOUT=0
+  gosu runner env \
+    SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+    SCCACHE_REGION="$SCCACHE_REGION" SCCACHE_S3_USE_SSL="$SCCACHE_S3_USE_SSL" \
+    AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+    SCCACHE_IDLE_TIMEOUT=0 SCCACHE_ERROR_LOG="$SCCACHE_ERROR_LOG" \
+    SCCACHE_LOG="$SCCACHE_LOG" \
+    sccache --start-server 2>&1 | tail -2 || true
+
+  # Assert the server really is on s3, via a throwaway compile first.
+  #
+  # `sccache --show-stats` on its own is NOT a trustworthy probe: with no server
+  # running it reports `Cache location  Local disk` from client-side defaults
+  # without starting one (no SCCACHE_ERROR_LOG is even created), which reads as a
+  # broken S3 config when nothing is wrong. Diagnosing that cost real time here.
+  # Routing one trivial compilation through the wrapper guarantees a server
+  # exists, so the backend line that follows describes reality.
+  #
+  # This matters because a cache silently on local disk is worse than no cache:
+  # it consumes the very volume this exists to relieve and returns a 0% hit rate,
+  # which is precisely how the previous sccache attempt on this fleet died
+  # unnoticed.
+  sccache_canary="$(mktemp -d)"
+  echo 'fn main() {}' > "${sccache_canary}/canary.rs"
+  chown -R runner:runner "$sccache_canary"
+  gosu runner env RUSTC_WRAPPER=sccache SCCACHE_IDLE_TIMEOUT=0 \
+    SCCACHE_BUCKET="$SCCACHE_BUCKET" SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" \
+    SCCACHE_REGION="$SCCACHE_REGION" SCCACHE_S3_USE_SSL="$SCCACHE_S3_USE_SSL" \
+    AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+    sccache rustc --crate-name canary --crate-type lib --emit=metadata \
+      -o "${sccache_canary}/canary.rmeta" "${sccache_canary}/canary.rs" >/dev/null 2>&1 || true
+  rm -rf "$sccache_canary"
+
+  sccache_backend="$(gosu runner sccache --show-stats 2>/dev/null | grep -i 'Cache location' || true)"
+  case "$sccache_backend" in
+    *s3*) echo "sccache: ENABLED -> ${SCCACHE_ENDPOINT}/${SCCACHE_BUCKET}" ;;
+    *)    echo "sccache: WARNING -- not on s3 after canary compile, got: ${sccache_backend:-<no stats>}" ;;
+  esac
+else
+  echo "sccache: DISABLED (${SCCACHE_ENDPOINT} unreachable) -- builds will be slower but will still succeed"
+fi
+
+echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG} RUSTC_WRAPPER=${RUSTC_WRAPPER:-<none>}"
 
 echo "Starting runner..."
 gosu runner ./run.sh &
