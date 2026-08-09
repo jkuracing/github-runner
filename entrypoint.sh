@@ -320,7 +320,16 @@ else
   echo "sccache: DISABLED (${SCCACHE_ENDPOINT} unreachable) -- builds will be slower but will still succeed"
 fi
 
+# Bound `target/` between jobs. sccache makes rebuilding cheap but does NOT make
+# target/ small -- the rlibs and test executables still land there at full size,
+# so without this the twelve replicas drift back to ~140 GB and refill the disk.
+# The runner runs this hook between jobs, so unlike a host cron racing twelve
+# replicas it can never delete a target dir out from under a live compile.
+export ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/job-completed-hook.sh
+export SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
+
 echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG} RUSTC_WRAPPER=${RUSTC_WRAPPER:-<none>}"
+echo "Sweep: target/ budget ${SWEEP_MAX_GB} GB per replica, enforced after each job"
 
 echo "Starting runner..."
 gosu runner ./run.sh &

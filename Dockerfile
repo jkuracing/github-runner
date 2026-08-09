@@ -197,9 +197,10 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     rm -rf /tmp/sccache.tar.gz "/tmp/${SCCACHE_PKG}" && \
     sccache --version
 
-# Copy entrypoint script
+# Copy entrypoint script and the post-job sweep hook
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY job-completed-hook.sh /usr/local/bin/job-completed-hook.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/job-completed-hook.sh
 
 # Create a non-root user and copy tools
 RUN useradd -m runner && \

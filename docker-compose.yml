@@ -201,7 +201,7 @@ services:
       '${SCCACHE_ACCESS_KEY:-sccache}' '${SCCACHE_SECRET_KEY:-sccache-secret}' &&
       mc mb --ignore-existing fleet/sccache &&
       mc ilm rule add --expire-days 14 fleet/sccache 2>/dev/null || true &&
-      mc quota set fleet/sccache --size ${SCCACHE_MAX_SIZE:-30GiB} 2>/dev/null || true &&
+      mc quota set fleet/sccache --size ${SCCACHE_MAX_SIZE:-20GiB} 2>/dev/null || true &&
       echo 'sccache bucket ready:' && mc du fleet/sccache
       "
 
