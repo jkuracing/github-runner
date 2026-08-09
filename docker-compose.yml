@@ -57,6 +57,59 @@ x-runner: &runner
     # machine. The cpus limit below only throttles the result; capping the thread
     # count is what actually avoids the thrashing.
     CARGO_BUILD_JOBS: ${RUNNER_CPUS:-2}
+    # Disk, not memory or CPU, is what this fleet runs out of. Measured
+    # 2026-08-09 with the host volume down to 294 MB free: the 12 container
+    # writable layers held 170 GB, and 85% of that was ONE directory per
+    # replica -- hbf's target/ at 11-13 GB (firmware's is 0.9 GB). The
+    # per-replica cargo registry and sccache volumes that this file goes to
+    # such lengths to keep separate are only ~29 GB combined, so they are not
+    # the problem and sharing them would not fix it. target/ cannot be shared
+    # at all: cargo takes an exclusive lock per target directory, so one
+    # shared dir would serialise all 12 replicas and destroy the parallelism
+    # that is the entire point of the fleet. The lever is to make each target/
+    # smaller, not fewer of them.
+    #
+    # Both variables are set here rather than in either repo's workflow so
+    # they apply to every job on the fleet without changing what hosted
+    # runners or a developer's laptop do. Neither repo sets these in its
+    # workflow env, so the container's value is what the job sees.
+    #
+    # Incremental state is pure waste in CI -- each job is a different commit
+    # and nothing downstream reuses the dep-graph fingerprints. It was
+    # measured at 2.8 GB per replica in hbf's target/ (14 GB in a long-lived
+    # developer checkout, which is what this avoids becoming).
+    CARGO_INCREMENTAL: "0"
+    # A floor, NOT a saving -- do not expect this one to reclaim anything.
+    # hbf's ci.yml already set it on 2026-08-08 (3a6e615), and the 11-13 GB
+    # target dirs measured here are ALREADY the reduced size: objdump on the
+    # largest test executable shows .debug_loc at 0 bytes with .debug_line the
+    # dominant section, which is the line-tables-only signature. It is set here
+    # so the property holds for every job on the fleet regardless of what any
+    # one workflow remembers to configure, and because firmware_ci.yml sets
+    # only CARGO_PROFILE_RELEASE_DEBUG, leaving its dev profile uncovered.
+    #
+    # Keeps file and line numbers -- what RUST_BACKTRACE=1 in both CI configs
+    # actually consumes -- and drops the variable and type records nothing here
+    # reads. Verified safe for hbf: no crate links gimli, object or addr2line,
+    # and its current_exe() calls locate sibling binaries rather than parse
+    # them. probe-rs reads DWARF from *target firmware* ELFs, unaffected by how
+    # hbf itself is compiled.
+    CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    # NOTE: sccache is currently DEAD here, which is why wiping a target/ dir
+    # is a genuinely cold rebuild rather than a cheap one. The binary is not in
+    # the image at all (`sccache --version` -> not found), no RUSTC_WRAPPER is
+    # ever set, and the newest entry in the 1.1 GB-per-replica cache volumes
+    # dates to 2026-07-28 -- an abandoned experiment holding ~13 GB fleet-wide.
+    #
+    # Wiring it up properly is the real fix for the 12x target/ duplication:
+    # sccache keys per-crate rustc output on content in a store OUTSIDE
+    # target/, which is what makes target/ disposable. Note CARGO_INCREMENTAL=0
+    # above is a PREREQUISITE, not a conflict -- sccache cannot cache
+    # incrementally compiled units and silently bypasses them. Unlike the cargo
+    # registry (see the header comment for why sharing that corrupts builds), a
+    # single sccache CAN be shared safely across all 12 replicas, but only via a
+    # server backend (redis/S3/webdav); a shared local directory is unsafe
+    # because each sccache server process keeps its own in-memory LRU index.
   deploy:
     resources:
       limits:
@@ -79,8 +132,18 @@ x-runner: &runner
         # observed idle time justifies.
         #
         # DISK is now the limiting factor, not memory: each replica keeps its own
-        # target/ for both repositories on one 200 GB volume, which was 47% full
-        # at 8 replicas. Watch `docker system df` before going wider.
+        # target/ for both repositories. At 12 replicas this reached 170 GB of
+        # container layers and took the host volume down to 294 MB free, which
+        # does not fail as "out of disk" -- it surfaces as
+        # `collect2: ld terminated with signal 7 [Bus error]`, the linker dying
+        # mid-write. hbf's own ci.yml documents the same symptom on hosted
+        # runners. Treat any inexplicable linker or codegen failure across
+        # several replicas as a disk check first.
+        #
+        # See CARGO_INCREMENTAL / CARGO_PROFILE_DEV_DEBUG above for the fix, and
+        # note it is PROSPECTIVE: existing target/ dirs keep their incremental
+        # state and fat debuginfo until rebuilt, so landing those variables
+        # reclaims nothing on its own. Run `docker system df` before going wider.
         cpus: ${RUNNER_CPUS:-2}
         memory: ${RUNNER_MEMORY:-4g}
 
