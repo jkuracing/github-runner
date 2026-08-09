@@ -151,6 +151,43 @@ handle_shutdown() {
 }
 trap handle_shutdown SIGTERM SIGINT
 
+# Cargo knobs applied to every job this replica runs.
+#
+# Exporting here is what makes these changeable by a plain `docker restart`.
+# `docker compose` bakes a container's environment at CREATION time, so setting
+# them only in docker-compose.yml means they reach a job solely after
+# `up -d` -- which RECREATES the container, destroying `_work` along with the
+# 11-13 GB warm `target/` dir that lives on the writable layer. Restart keeps
+# it. The runner inherits this process's environment and hands it to each job
+# step, so an export reaches the compiler.
+#
+# Do NOT move these into /actions-runner/.env. That file is read only by the
+# systemd unit `svc.sh` generates; this entrypoint execs ./run.sh directly and
+# run.sh contains no reference to it -- verified, not assumed. The stock .env is
+# empty here and `env.sh` merely writes it for that service path.
+#
+# The defaults live here rather than in docker-compose.yml so that one file owns
+# them; compose or `docker run -e` can still override either value.
+
+# Incremental state is pure waste in CI: every job builds a different commit and
+# nothing downstream reuses the dep-graph fingerprints. Measured at 2.8 GB per
+# replica in hbf's target/ (and 14 GB in a long-lived developer checkout, which
+# is what this keeps the fleet from becoming). It is also a prerequisite for
+# sccache rather than a rival to it -- sccache cannot cache incrementally
+# compiled units and silently bypasses them.
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+
+# A floor, NOT a saving -- do not expect this to reclaim anything. hbf's ci.yml
+# already sets it workflow-wide as of 3a6e615, and the target dirs measured on
+# this fleet are already the reduced size: objdump on the largest test
+# executable shows .debug_loc at 0 bytes with .debug_line the dominant section,
+# the line-tables-only signature. Set here so the property holds for every job
+# whatever an individual workflow remembers to configure; firmware_ci.yml sets
+# only CARGO_PROFILE_RELEASE_DEBUG and leaves its dev profile uncovered.
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
+
+echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG}"
+
 echo "Starting runner..."
 gosu runner ./run.sh &
 RUNNER_PID=$!

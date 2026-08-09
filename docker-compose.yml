@@ -69,32 +69,19 @@ x-runner: &runner
     # that is the entire point of the fleet. The lever is to make each target/
     # smaller, not fewer of them.
     #
-    # Both variables are set here rather than in either repo's workflow so
-    # they apply to every job on the fleet without changing what hosted
-    # runners or a developer's laptop do. Neither repo sets these in its
-    # workflow env, so the container's value is what the job sees.
+    # The cargo knobs that act on this -- CARGO_INCREMENTAL and
+    # CARGO_PROFILE_DEV_DEBUG -- are deliberately NOT set here, and
+    # entrypoint.sh owns their defaults instead. A value set in this file only
+    # reaches a job once `up -d` RECREATES the container, which destroys _work
+    # and with it the warm target/ dir on the writable layer -- the very thing
+    # being economised. Exported from the entrypoint, a plain `docker restart`
+    # applies them and keeps the caches. Add either name here to override, and
+    # see entrypoint.sh for why /actions-runner/.env cannot serve this purpose.
     #
-    # Incremental state is pure waste in CI -- each job is a different commit
-    # and nothing downstream reuses the dep-graph fingerprints. It was
-    # measured at 2.8 GB per replica in hbf's target/ (14 GB in a long-lived
-    # developer checkout, which is what this avoids becoming).
-    CARGO_INCREMENTAL: "0"
-    # A floor, NOT a saving -- do not expect this one to reclaim anything.
-    # hbf's ci.yml already set it on 2026-08-08 (3a6e615), and the 11-13 GB
-    # target dirs measured here are ALREADY the reduced size: objdump on the
-    # largest test executable shows .debug_loc at 0 bytes with .debug_line the
-    # dominant section, which is the line-tables-only signature. It is set here
-    # so the property holds for every job on the fleet regardless of what any
-    # one workflow remembers to configure, and because firmware_ci.yml sets
-    # only CARGO_PROFILE_RELEASE_DEBUG, leaving its dev profile uncovered.
+    # Setting them on the fleet rather than in either repo's workflow keeps
+    # hosted runners and developer laptops unaffected. Neither repo sets
+    # CARGO_INCREMENTAL, so the fleet's value is what a job sees.
     #
-    # Keeps file and line numbers -- what RUST_BACKTRACE=1 in both CI configs
-    # actually consumes -- and drops the variable and type records nothing here
-    # reads. Verified safe for hbf: no crate links gimli, object or addr2line,
-    # and its current_exe() calls locate sibling binaries rather than parse
-    # them. probe-rs reads DWARF from *target firmware* ELFs, unaffected by how
-    # hbf itself is compiled.
-    CARGO_PROFILE_DEV_DEBUG: line-tables-only
     # NOTE: sccache is currently DEAD here, which is why wiping a target/ dir
     # is a genuinely cold rebuild rather than a cheap one. The binary is not in
     # the image at all (`sccache --version` -> not found), no RUSTC_WRAPPER is
