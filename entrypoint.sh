@@ -169,12 +169,32 @@ trap handle_shutdown SIGTERM SIGINT
 # The defaults live here rather than in docker-compose.yml so that one file owns
 # them; compose or `docker run -e` can still override either value.
 
-# Incremental state is pure waste in CI: every job builds a different commit and
-# nothing downstream reuses the dep-graph fingerprints. Measured at 2.8 GB per
-# replica in hbf's target/ (and 14 GB in a long-lived developer checkout, which
-# is what this keeps the fleet from becoming). It is also a prerequisite for
-# sccache rather than a rival to it -- sccache cannot cache incrementally
-# compiled units and silently bypasses them.
+# Worth 2.8 GB per replica (14 GB in a long-lived developer checkout, which is
+# what this keeps the fleet from becoming).
+#
+# This is a trade, NOT free: an earlier version of this comment called
+# incremental state "pure waste in CI, since every job is a different commit",
+# which is wrong here. hbf's ci.yml deliberately uses `clean: false` to keep
+# `target/` warm across jobs, so successive jobs on one replica genuinely can
+# hit an incremental cache.
+#
+# The exposure is bounded and judged worth the disk:
+#   - It only ever covers hbf's own dozen workspace crates. Registry
+#     dependencies -- which are the whole 8.4 GB bulk of debug/deps -- are
+#     compiled non-incrementally regardless of this setting.
+#   - A hit needs the SAME replica to rebuild a NEARLY IDENTICAL commit. Jobs
+#     go to whichever of the 12 replicas is free, with no branch affinity, so
+#     that is luck rather than design.
+#   - Where nothing changed at all, cargo's ordinary fingerprinting skips the
+#     crate outright and incremental adds nothing.
+#   - It is not free even when it hits: incremental raises the codegen-unit
+#     count, which costs some link time back.
+#
+# It is also a prerequisite for sccache rather than a rival to it -- sccache
+# cannot cache incrementally compiled units and silently bypasses them. sccache
+# would hit across every crate, replica and commit rather than only the
+# same-replica-similar-commit case, so trading incremental for it is a clear win
+# whenever someone wires it up.
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 
 # A floor, NOT a saving -- do not expect this to reclaim anything. hbf's ci.yml
