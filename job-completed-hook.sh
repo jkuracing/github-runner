@@ -32,7 +32,16 @@
 set -uo pipefail
 
 SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
-WORK_DIR="${RUNNER_WORKSPACE:-/actions-runner/_work}"
+# The runner root's _work, NOT $RUNNER_WORKSPACE.
+#
+# This originally read `${RUNNER_WORKSPACE:-/actions-runner/_work}`, which was
+# wrong: RUNNER_WORKSPACE is per-REPOSITORY (`_work/<repo>`), so the budget was
+# enforced once per repo rather than once per replica. With firmware and hbf both
+# checked out, each replica could hold 2 x SWEEP_MAX_GB. Measured the morning
+# after rollout: five replicas sat at 6.8-7.2 GB against a nominal 4 GB budget,
+# and the fleet total reached 52 GB against a 48 GB ceiling. SWEEP_WORK_DIR
+# stays overridable for testing.
+WORK_DIR="${SWEEP_WORK_DIR:-/actions-runner/_work}"
 # _work holds more than checkouts (_tool, _temp, _actions), so measure the whole
 # thing -- that is what actually occupies the writable layer.
 [[ -d "$WORK_DIR" ]] || exit 0
