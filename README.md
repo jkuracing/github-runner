@@ -15,7 +15,9 @@ This runner includes all tools required for the firmware CI pipeline:
 ### Build Tools
 
 - **just** - Command runner used by the firmware project
-- **Pkl** (v0.29.1) - Apple's configuration language (used by canvas)
+- **Pkl** (v0.31.1) - Apple's configuration language (used by canvas); `/usr/local/bin`
+  is writable by the `runner` user so consuming workflows can self-install a
+  different pinned version without hitting `EACCES`
 - **maturin** - Build Python wheels from Rust code
 
 ### Python
