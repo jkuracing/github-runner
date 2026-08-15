@@ -62,13 +62,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 # ============================================================================
 # Install Pkl (Apple's configuration language - used by canvas)
 # ============================================================================
+# Version matches what bender-driver/dti-fsic-driver/vehicle-message-definitions
+# actually pin in their "Install PKL CLI" workflow step (verified against those
+# repos' ci.yml, not assumed) -- see the useradd block below for why this alone
+# does not fix those workflows' install step.
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
         amd64) PKL_ARCH=amd64 ;; \
         arm64) PKL_ARCH=aarch64 ;; \
         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac && \
-    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.30.1/pkl-linux-${PKL_ARCH}" && \
+    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-${PKL_ARCH}" && \
     chmod +x /usr/local/bin/pkl
 
 # ============================================================================
@@ -197,10 +201,12 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     rm -rf /tmp/sccache.tar.gz "/tmp/${SCCACHE_PKG}" && \
     sccache --version
 
-# Copy entrypoint script and the post-job sweep hook
+# Copy entrypoint script, the post-job sweep hook, and the pre-job gitconfig
+# reset hook
 COPY entrypoint.sh /entrypoint.sh
 COPY job-completed-hook.sh /usr/local/bin/job-completed-hook.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/job-completed-hook.sh
+COPY job-started-hook.sh /usr/local/bin/job-started-hook.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/job-completed-hook.sh /usr/local/bin/job-started-hook.sh
 
 # Create a non-root user and copy tools
 RUN useradd -m runner && \
@@ -226,7 +232,30 @@ RUN useradd -m runner && \
     # Add source export-esp.sh to runner's bashrc
     echo 'source $HOME/export-esp.sh 2>/dev/null || true' >> /home/runner/.bashrc && \
     # Fix ownership
-    chown -R runner:runner /home/runner
+    chown -R runner:runner /home/runner && \
+    # Several consuming repos' workflows self-install a version-pinned tool by
+    # curling a binary straight into /usr/local/bin and chmod +x-ing it -- e.g.
+    # bender-driver/dti-fsic-driver/vehicle-message-definitions all run:
+    #   curl -L -o /usr/local/bin/pkl https://.../pkl-<version> && chmod +x ...
+    # On a GitHub-hosted runner this succeeds because the job owns the whole VM.
+    # Here it hits EACCES: /usr/local/bin is root:root 0755 from the apt/curl
+    # installs above, and `curl -o` truncates the EXISTING pkl binary in place
+    # (an open() with O_TRUNC), which needs write on that file's inode, not just
+    # search/exec on the directory. A PATH-based redirect (e.g. exporting a
+    # writable $RUNNER_TEMP/bin) cannot fix this: the destination is a literal
+    # absolute path in those workflows, not something resolved via PATH, and
+    # editing every consuming repo's workflow is exactly the per-repo workaround
+    # this fleet's image is meant to avoid. So the directory itself has to
+    # become writable by the user that actually runs jobs.
+    #
+    # chown rather than chmod a+w to match this file's own idiom (chown -R
+    # runner:runner appears twice above) instead of leaving a world-writable
+    # system directory. /usr/local/bin holds nothing but the tools this image
+    # installs (just, pkl, uv/maturin, sccache, bun -- no apt package puts
+    # anything here), so handing it to runner does not touch anything owned by
+    # another principal, and the runner user already executes arbitrary job
+    # code with far broader access than this.
+    chown -R runner:runner /usr/local/bin
 
 # Environment variables for runner user
 ENV RUSTUP_HOME=/home/runner/.rustup \

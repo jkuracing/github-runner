@@ -328,8 +328,19 @@ fi
 export ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/job-completed-hook.sh
 export SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
 
+# Reset $HOME/.gitconfig before every job. Canvas-consuming repos' shared setup
+# snippet writes a git `insteadOf` rewrite with `git config --global set` (then
+# `--add`), which is safe on an ephemeral GitHub-hosted runner but accumulates
+# in this container's persistent $HOME/.gitconfig job after job until a later
+# `set` call hits an already multi-valued key and fails outright. See
+# job-started-hook.sh for why this is a job-STARTED hook rather than only
+# living in job-completed-hook.sh: it must run regardless of whether the
+# previous job finished, was cancelled, or was killed.
+export ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/job-started-hook.sh
+
 echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG} RUSTC_WRAPPER=${RUSTC_WRAPPER:-<none>}"
 echo "Sweep: target/ budget ${SWEEP_MAX_GB} GB per replica, enforced after each job"
+echo "Gitconfig: reset to a clean baseline before each job (ACTIONS_RUNNER_HOOK_JOB_STARTED)"
 
 echo "Starting runner..."
 gosu runner ./run.sh &
