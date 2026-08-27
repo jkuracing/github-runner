@@ -13,9 +13,14 @@ ARG TARGETARCH
 # ============================================================================
 # Base system dependencies (GitHub Actions Runner)
 # ============================================================================
+# rsync is not in ubuntu:24.04 but IS on the GitHub-hosted images, so a
+# workflow that deploys with it -- bender-driver's "Publish messages" rsyncs the
+# generated portal to the docs host -- passes there and dies here with
+# "rsync: command not found". Anything the hosted images provide and a consuming
+# workflow already relies on has to be baked in, not discovered per job.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl jq git bash libicu74 ca-certificates \
+        curl jq git bash libicu74 ca-certificates rsync \
         uuid-runtime iputils-ping gosu && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
