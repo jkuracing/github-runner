@@ -3,12 +3,24 @@ FROM ubuntu:24.04
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Populated by BuildKit with "amd64" or "arm64". Must be declared WITHOUT a
+# default: a default shadows the value the builder injects, which would silently
+# fetch the wrong architecture's binaries. Steps below fall back to
+# `dpkg --print-architecture` (same amd64/arm64 vocabulary) when it is unset,
+# so non-BuildKit builds still resolve the host architecture correctly.
+ARG TARGETARCH
+
 # ============================================================================
 # Base system dependencies (GitHub Actions Runner)
 # ============================================================================
+# rsync is not in ubuntu:24.04 but IS on the GitHub-hosted images, so a
+# workflow that deploys with it -- bender-driver's "Publish messages" rsyncs the
+# generated portal to the docs host -- passes there and dies here with
+# "rsync: command not found". Anything the hosted images provide and a consuming
+# workflow already relies on has to be baked in, not discovered per job.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl jq git bash libicu74 ca-certificates \
+        curl jq git bash libicu74 ca-certificates rsync \
         uuid-runtime iputils-ping gosu && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -55,19 +67,78 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 # ============================================================================
 # Install Pkl (Apple's configuration language - used by canvas)
 # ============================================================================
-RUN curl -L -o /usr/local/bin/pkl https://github.com/apple/pkl/releases/download/0.30.1/pkl-linux-amd64 && \
+# Version matches what bender-driver/dti-fsic-driver/vehicle-message-definitions
+# actually pin in their "Install PKL CLI" workflow step (verified against those
+# repos' ci.yml, not assumed) -- see the useradd block below for why this alone
+# does not fix those workflows' install step.
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) PKL_ARCH=amd64 ;; \
+        arm64) PKL_ARCH=aarch64 ;; \
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-${PKL_ARCH}" && \
     chmod +x /usr/local/bin/pkl
 
 # ============================================================================
 # Install uv (fast Python package manager) and maturin (Rust-Python build tool)
 # ============================================================================
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    # Add uv to PATH
-    . $HOME/.local/bin/env && \
-    # Install maturin globally via uv
-    uv tool install maturin
+# Installed into shared, world-readable locations rather than under /root, which
+# is mode 0700: a tool symlinked out of /root is unusable by the unprivileged
+# runner user that actually executes jobs.
+ENV UV_TOOL_DIR=/opt/uv/tools
 
-ENV PATH="/root/.local/bin:${PATH}"
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh && \
+    # Install maturin globally, with its launcher on the shared PATH
+    UV_TOOL_BIN_DIR=/usr/local/bin uv tool install maturin && \
+    chmod -R a+rX /opt/uv
+
+# ============================================================================
+# Web UI and Tauri desktop dependencies (hbf)
+# ============================================================================
+# Deliberately placed AFTER the espup layer. Docker invalidates every layer
+# below an edited one, and rebuilding the Xtensa toolchain costs many minutes,
+# so anything added later must stay later.
+#
+# `cargo build -p hbf-gui` links against webkit2gtk-4.1 and fails at
+# pkg-config time without the -dev package; librsvg2 and appindicator3 are
+# Tauri's SVG and tray-icon dependencies. This mirrors the apt list hbf CI
+# installs per job, minus what the firmware layers above already provide
+# (libudev-dev, pkg-config, libssl-dev).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+        librsvg2-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Node is needed even though bun is the package manager, because bun does not
+# replace it as a script *interpreter*. hbf's `ts_export` test execs
+# `ui/node_modules/.bin/prettier` directly from Rust; that file is a .cjs script
+# whose shebang is `#!/usr/bin/env node`, so without node the exec fails with
+# status 127 and the drift check reports "bindings would drift". `bun run lint`
+# and `bun run check` are unaffected because `bun run` interprets the JS itself
+# and never consults the shebang -- which is exactly why this gap is invisible
+# until something shells out to a .bin entry.
+#
+# npm comes along for `npx`, which the same test falls back to when the
+# project-local binary is absent. GitHub-hosted runners preinstall both, which is
+# why this only surfaced on the fleet.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nodejs npm && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    node --version && npx --version
+
+# bun builds the SvelteKit bundle that `tauri::generate_context!()` embeds at
+# COMPILE time, so it is a build dependency of hbf-gui rather than a test-only
+# tool. Pinned to the version hbf CI's `oven-sh/setup-bun` requests so lockfile
+# resolution is identical on both. BUN_INSTALL places the binary on the shared
+# PATH instead of under /root, which is mode 0700 and therefore invisible to the
+# unprivileged runner user -- the same trap the uv block above documents.
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14" && \
+    chmod a+rx /usr/local/bin/bun && \
+    bun --version
 
 # ============================================================================
 # Create runner directory and download GitHub Actions Runner
@@ -75,13 +146,19 @@ ENV PATH="/root/.local/bin:${PATH}"
 RUN mkdir -p /actions-runner
 WORKDIR /actions-runner
 
-RUN LATEST_TAG=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name) && \
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) RUNNER_ARCH=x64 ;; \
+        arm64) RUNNER_ARCH=arm64 ;; \
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    LATEST_TAG=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name) && \
     RUNNER_VERSION=${LATEST_TAG#v} && \
-    echo "Downloading Runner Version: ${RUNNER_VERSION}" && \
-    curl -L -o actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz \
-        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" && \
-    tar xzf actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz && \
-    rm actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz
+    echo "Downloading Runner Version: ${RUNNER_VERSION} (${RUNNER_ARCH})" && \
+    curl -fL -o runner.tar.gz \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" && \
+    tar xzf runner.tar.gz && \
+    rm runner.tar.gz
 
 # ============================================================================
 # Setup SSH for private repository access (submodules)
@@ -91,9 +168,50 @@ RUN mkdir -p /root/.ssh && \
     ssh-keyscan github.com >> /root/.ssh/known_hosts && \
     chmod 644 /root/.ssh/known_hosts
 
-# Copy entrypoint script
+# ============================================================================
+# sccache -- shared compilation cache
+# ============================================================================
+# Placement is deliberate on both sides. It sits AFTER the espup and bun layers,
+# so adding it never invalidates the multi-GB Xtensa toolchain, and BEFORE
+# `COPY entrypoint.sh`, because that COPY invalidates every layer after it
+# whenever the entrypoint changes -- re-downloading sccache on each entrypoint
+# tweak would be pure waste.
+#
+# Why it exists: every replica keeps its own `target/`, and hbf's reaches
+# 11-13 GB, so twelve of them took a 926 GB volume down to 294 MB free on
+# 2026-08-09, at which point CI began failing with
+# `collect2: ld terminated with signal 7 [Bus error]` -- disk exhaustion wearing
+# a linker bug's clothing.
+#
+# sccache does NOT shrink `target/`. It caches rustc invocations in a store
+# outside it, so the rlibs and test executables still land there at full size.
+# What it buys is that DELETING a target dir becomes cheap, which is what makes
+# those dirs disposable rather than something to hoard. Bounding disk therefore
+# needs sccache AND a recurring sweep; sccache on its own does not do it.
+#
+# The musl build is static, so it is indifferent to the glibc version of whatever
+# base image this is rebuilt on.
+ARG SCCACHE_VERSION=v0.17.0
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    case "$ARCH" in \
+        amd64) SCCACHE_ARCH=x86_64 ;; \
+        arm64) SCCACHE_ARCH=aarch64 ;; \
+        *) echo "ERROR: unsupported architecture for sccache: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    SCCACHE_PKG="sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl" && \
+    curl -fsSL -o /tmp/sccache.tar.gz \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${SCCACHE_PKG}.tar.gz" && \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp && \
+    install -m 0755 "/tmp/${SCCACHE_PKG}/sccache" /usr/local/bin/sccache && \
+    rm -rf /tmp/sccache.tar.gz "/tmp/${SCCACHE_PKG}" && \
+    sccache --version
+
+# Copy entrypoint script, the post-job sweep hook, and the pre-job gitconfig
+# reset hook
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY job-completed-hook.sh /usr/local/bin/job-completed-hook.sh
+COPY job-started-hook.sh /usr/local/bin/job-started-hook.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/job-completed-hook.sh /usr/local/bin/job-started-hook.sh
 
 # Create a non-root user and copy tools
 RUN useradd -m runner && \
@@ -105,9 +223,12 @@ RUN useradd -m runner && \
     cp -r /root/.rustup/* /home/runner/.rustup/ 2>/dev/null || true && \
     # Copy export-esp.sh to runner home
     cp /root/export-esp.sh /home/runner/export-esp.sh 2>/dev/null || true && \
-    # Copy uv and tools to runner user
-    mkdir -p /home/runner/.local && \
-    cp -r /root/.local/* /home/runner/.local/ 2>/dev/null || true && \
+    # uv and its tools (maturin) live in /usr/local/bin and /opt/uv, which are
+    # already on the shared PATH and readable by this user — nothing to copy.
+    # Pre-create the sccache directory so its named volume is seeded with runner
+    # ownership. A volume mounted over a path that does not exist in the image is
+    # created root-owned, which the unprivileged runner cannot write to.
+    mkdir -p /home/runner/.cache/sccache && \
     # Copy SSH config to runner user
     mkdir -p /home/runner/.ssh && \
     cp /root/.ssh/known_hosts /home/runner/.ssh/ && \
@@ -116,7 +237,30 @@ RUN useradd -m runner && \
     # Add source export-esp.sh to runner's bashrc
     echo 'source $HOME/export-esp.sh 2>/dev/null || true' >> /home/runner/.bashrc && \
     # Fix ownership
-    chown -R runner:runner /home/runner
+    chown -R runner:runner /home/runner && \
+    # Several consuming repos' workflows self-install a version-pinned tool by
+    # curling a binary straight into /usr/local/bin and chmod +x-ing it -- e.g.
+    # bender-driver/dti-fsic-driver/vehicle-message-definitions all run:
+    #   curl -L -o /usr/local/bin/pkl https://.../pkl-<version> && chmod +x ...
+    # On a GitHub-hosted runner this succeeds because the job owns the whole VM.
+    # Here it hits EACCES: /usr/local/bin is root:root 0755 from the apt/curl
+    # installs above, and `curl -o` truncates the EXISTING pkl binary in place
+    # (an open() with O_TRUNC), which needs write on that file's inode, not just
+    # search/exec on the directory. A PATH-based redirect (e.g. exporting a
+    # writable $RUNNER_TEMP/bin) cannot fix this: the destination is a literal
+    # absolute path in those workflows, not something resolved via PATH, and
+    # editing every consuming repo's workflow is exactly the per-repo workaround
+    # this fleet's image is meant to avoid. So the directory itself has to
+    # become writable by the user that actually runs jobs.
+    #
+    # chown rather than chmod a+w to match this file's own idiom (chown -R
+    # runner:runner appears twice above) instead of leaving a world-writable
+    # system directory. /usr/local/bin holds nothing but the tools this image
+    # installs (just, pkl, uv/maturin, sccache, bun -- no apt package puts
+    # anything here), so handing it to runner does not touch anything owned by
+    # another principal, and the runner user already executes arbitrary job
+    # code with far broader access than this.
+    chown -R runner:runner /usr/local/bin
 
 # Environment variables for runner user
 ENV RUSTUP_HOME=/home/runner/.rustup \
