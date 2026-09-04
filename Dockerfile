@@ -67,17 +67,20 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 # ============================================================================
 # Install Pkl (Apple's configuration language - used by canvas)
 # ============================================================================
-# Version matches what bender-driver/dti-fsic-driver/vehicle-message-definitions
-# actually pin in their "Install PKL CLI" workflow step (verified against those
-# repos' ci.yml, not assumed) -- see the useradd block below for why this alone
-# does not fix those workflows' install step.
+# Version matches the pin in vs-website's vs-registry-auth action (its
+# `pkl-version` default), which every codegen job now runs and which needs
+# 0.32+ for `pkl download-package --http-header`. When the image's pkl is
+# older than that, the action installs its own copy -- which, before it was
+# made persistent, meant a ~40 MB GitHub download in EVERY job on a persistent
+# replica (11 minutes each over a bad link, 2026-09-04). Keep the two in step:
+# bump here whenever the action's default moves.
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     case "$ARCH" in \
         amd64) PKL_ARCH=amd64 ;; \
         arm64) PKL_ARCH=aarch64 ;; \
         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac && \
-    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-${PKL_ARCH}" && \
+    curl -fL -o /usr/local/bin/pkl "https://github.com/apple/pkl/releases/download/0.32.1/pkl-linux-${PKL_ARCH}" && \
     chmod +x /usr/local/bin/pkl
 
 # ============================================================================
