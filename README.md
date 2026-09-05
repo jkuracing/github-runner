@@ -30,6 +30,7 @@ This runner includes all tools required for the firmware CI pipeline:
 
 - **SSH** - Pre-configured with GitHub's host keys for private submodule access
 - Standard build essentials (`build-essential`, `pkg-config`, `libssl-dev`)
+- **WebKitGTK / Tauri stack** for hbf's desktop app, plus `file` for appimagetool
 
 ## Architectures
 
