@@ -108,10 +108,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 # Tauri's SVG and tray-icon dependencies. This mirrors the apt list hbf CI
 # installs per job, minus what the firmware layers above already provide
 # (libudev-dev, pkg-config, libssl-dev).
+#
+# `file` is for appimagetool, which tauri-bundler runs to pack hbf's Linux
+# AppImage (hbf's publish-gui.yml) and which refuses to start without the
+# file command ("file command is missing but required"). hbf carries an
+# unprivileged download-and-unpack workaround for replicas built without it
+# (.github/scripts/ensure-file-tool.sh); that script is a no-op once this
+# package is in the image.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-        librsvg2-dev && \
+        librsvg2-dev file && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Node is needed even though bun is the package manager, because bun does not
