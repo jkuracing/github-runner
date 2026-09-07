@@ -207,6 +207,11 @@ on this system.
     + FullyQualifiedErrorId : UnauthorizedAccess
 ```
 
+**Workflow steps.** The runner writes each `run:` block to a temp `.ps1` and
+invokes it the same way, so on a machine at the Windows default every step
+without an explicit `shell:` fails too. Consuming workflows should set
+`defaults.run.shell: bash` for jobs on these runners — hbf's do.
+
 **The job hooks.** The runner invokes a `.ps1` hook as
 `powershell.EXE -command ". '<path>'"` with no `-ExecutionPolicy`, and that is
 not configurable. Because a non-zero hook fails the job, an unsigned `.ps1`
@@ -319,6 +324,8 @@ Established empirically against hbf rather than from vendor docs:
 | Pkl | A build script shells out to it. No ARM64 build exists; the amd64 exe runs emulated. |
 | bun | `hbf-gui`'s `generate_context!` embeds `ui/build` at *compile* time. |
 | WebView2 | Preinstalled on Windows 11; checked, not assumed. |
+| `gh` | Mints the runner registration token, so no PAT is needed. |
+| `jq` | The shared `vs-registry-auth` action parses the registry config with it. Absent, that check fails as *"returned 200 but not the registry config (SSO page?)"* — pointing at the registry rather than at the missing binary. Linux gets jq from its base packages, so this gap is Windows-only. |
 
 `winget` is deliberately unused -- it hangs under a non-interactive remote
 session on this VM, so every install is `curl` plus a silent installer.

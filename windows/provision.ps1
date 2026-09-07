@@ -697,6 +697,23 @@ if (-not $SkipToolchain) {
   }
   Add-MachinePath $ghDir
 
+  # jq. Not a build tool -- the shared vs-registry-auth action parses the
+  # registry config with it, and when jq is absent that check fails as
+  # "returned 200 but not the registry config (SSO page?)", which points at
+  # the registry rather than at the missing binary. The Linux image has jq
+  # from its base packages, so this gap is Windows-only and does not show up
+  # anywhere else.
+  $jqDir = 'C:\Program Files\jq'
+  if (-not (Test-Path "$jqDir\jq.exe")) {
+    $jqArch = if ($isArm) { 'arm64' } else { 'amd64' }
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/jqlang/jq/releases/latest'
+    $asset = $rel.assets | Where-Object { $_.name -eq "jq-windows-$jqArch.exe" } | Select-Object -First 1
+    if (-not $asset) { Fail "No jq-windows-$jqArch.exe in the latest jq release." }
+    New-Item -ItemType Directory -Force -Path $jqDir | Out-Null
+    Get-File $asset.browser_download_url "$jqDir\jq.exe"
+  }
+  Add-MachinePath $jqDir
+
   # WebView2 is preinstalled on Windows 11. Checked rather than assumed,
   # because a missing runtime fails at GUI launch, long after the build.
   $wv = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
