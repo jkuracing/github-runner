@@ -238,8 +238,31 @@ function Write-HookFiles {
   # the first line is tolerated by PowerShell but shows up in diffs and logs.
   $JobStartedHook   | Set-Content -LiteralPath $a -Encoding ASCII
   $JobCompletedHook | Set-Content -LiteralPath $b -Encoding ASCII
+
+  # The runner is pointed at these .cmd wrappers, NOT at the .ps1 directly.
+  #
+  # It invokes a .ps1 hook as `powershell.EXE -command ". '<path>'"` with no
+  # -ExecutionPolicy, so on a default install (RemoteSigned/Restricted) the
+  # unsigned hook is refused with PSSecurityException -- and because a non-zero
+  # hook fails the job, EVERY job dies in the "Set up runner" step before a
+  # single line of the workflow executes. A .cmd hook runs through cmd.exe,
+  # where no execution policy applies, and it can pass the bypass explicitly.
+  #
+  # The alternative -- relaxing the machine's execution policy -- is a
+  # system-wide security setting, and changing it to run our own two scripts
+  # would be a poor trade for something a wrapper solves locally.
+  $wrappers = @()
+  foreach ($ps1 in @($a, $b)) {
+    $cmd = [IO.Path]::ChangeExtension($ps1, '.cmd')
+    @(
+      '@echo off'
+      "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"%~dp0$([IO.Path]::GetFileName($ps1))`""
+      'exit /b %ERRORLEVEL%'
+    ) | Set-Content -LiteralPath $cmd -Encoding ASCII
+    $wrappers += $cmd
+  }
   Info "Hooks written to $Destination"
-  return @($a, $b)
+  return $wrappers
 }
 
 # --------------------------------------------------------------------------
@@ -794,8 +817,8 @@ $machineEnv = @{
   'CARGO_BUILD_JOBS'         = "$BuildJobs"
   'CARGO_INCREMENTAL'        = '0'
   'CARGO_PROFILE_DEV_DEBUG'  = 'line-tables-only'
-  'ACTIONS_RUNNER_HOOK_JOB_STARTED'   = (Join-Path $hooks 'job-started-hook.ps1')
-  'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' = (Join-Path $hooks 'job-completed-hook.ps1')
+  'ACTIONS_RUNNER_HOOK_JOB_STARTED'   = (Join-Path $hooks 'job-started-hook.cmd')
+  'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' = (Join-Path $hooks 'job-completed-hook.cmd')
   'SWEEP_MAX_GB'             = '8'
 }
 foreach ($k in $machineEnv.Keys) {
@@ -805,6 +828,15 @@ foreach ($k in $machineEnv.Keys) {
 
 $svc = Get-Service | Where-Object { $_.Name -like 'actions.runner.*' } | Select-Object -First 1
 if ($SkipRegistration) {
+  # Machine environment above may have changed even though registration was
+  # skipped -- a service already installed here would otherwise keep running
+  # with the old values until something else restarted it.
+  if ($svc) {
+    Info "Restarting $($svc.Name) so it picks up the machine environment"
+    Restart-Service $svc.Name
+    Start-Sleep -Seconds 3
+    Info "Service status: $((Get-Service $svc.Name).Status)"
+  }
   Info ''
   Info 'Toolchain installed. To finish, run this from an ELEVATED PowerShell'
   Info 'on the machine itself -- config.cmd prompts for the account password on'

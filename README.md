@@ -190,6 +190,40 @@ the script:
 deliberate rather than an oversight: it keeps the password inside the runner
 instead of on a command line, where `--windowslogonpassword` would put it.
 
+### PowerShell execution policy
+
+A default Windows install will not run an unsigned `.ps1` invoked by path. This
+bites in two separate places, and both are handled rather than worked around by
+loosening the machine's policy -- that is a system-wide security setting, and
+changing it so this repo's own two hooks can run would be a poor trade.
+
+**Invoking the provisioner.** Every documented command goes through
+`powershell -NoProfile -ExecutionPolicy Bypass -File ...`, which scopes the
+exemption to that one process. Running `.\provision.ps1` directly fails with:
+
+```
+File ...\provision.ps1 cannot be loaded because running scripts is disabled
+on this system.
+    + FullyQualifiedErrorId : UnauthorizedAccess
+```
+
+**The job hooks.** The runner invokes a `.ps1` hook as
+`powershell.EXE -command ". '<path>'"` with no `-ExecutionPolicy`, and that is
+not configurable. Because a non-zero hook fails the job, an unsigned `.ps1`
+hook kills **every job** in the `Set up runner` step, before a single workflow
+line executes:
+
+```
+Set up runner   . : File C:\actions-runner\hooks\job-started-hook.ps1 cannot
+                    be loaded because running scripts is disabled on this system
+                ##[error]Process completed with exit code 1.
+```
+
+So `ACTIONS_RUNNER_HOOK_JOB_STARTED` / `_COMPLETED` point at generated `.cmd`
+wrappers instead. A `.cmd` hook runs through `cmd.exe`, where no execution
+policy applies, and it re-invokes the `.ps1` with the bypass. Both the wrappers
+and the scripts live in `<RunnerRoot>\hooks\`.
+
 ### Unattended runs
 
 Every interactive path degrades to a printed instruction rather than a hang,
