@@ -143,10 +143,27 @@ provisioning, and it is idempotent -- re-running it upgrades the toolchain and
 re-registers against a freshly minted token, which is the intended way to
 update a machine rather than only to build one.
 
+`provision.ps1` is **one self-contained file**. It needs nothing else from
+this repo -- the job hooks are embedded and written out during provisioning --
+so it can be copied to a new machine on its own, and it handles x64 and ARM64
+identically.
+
 ```powershell
 # Elevated PowerShell, on the machine that will run jobs.
 $env:GITHUB_PAT = '<classic PAT with admin:org>'
-.\windows\provision.ps1 -ServiceAccount '.\ci'
+
+# Preview everything it would derive, without touching the machine:
+.\provision.ps1 -ServiceAccount '.\ci' -DryRun
+
+# Then for real:
+.\provision.ps1 -ServiceAccount '.\ci'
+```
+
+Or fetch just that file onto a fresh machine:
+
+```powershell
+$u = 'https://raw.githubusercontent.com/jkuracing/github-runner/main/windows/provision.ps1'
+Invoke-WebRequest $u -OutFile provision.ps1 -UseBasicParsing
 ```
 
 ### The service account is not optional, and must not be SYSTEM
@@ -203,9 +220,16 @@ session on this VM, so every install is `curl` plus a silent installer.
 
 ### Hooks and machine environment
 
-`windows/job-started-hook.ps1` and `windows/job-completed-hook.ps1` are the
-PowerShell twins of the `.sh` hooks, for the same reasons: resetting an
-accumulating `.gitconfig` before each job, and bounding `target/` after it.
+The job hooks are embedded in `provision.ps1` and written to
+`<RunnerRoot>\hooks\` during provisioning -- that is what keeps the script a
+single file. They are PowerShell twins of the `.sh` hooks, for the same
+reasons: resetting an accumulating `.gitconfig` before each job, and bounding
+`target/` after it. `-DryRun` writes them to `%TEMP%` so you can read exactly
+what will be installed.
+
+They are written for **Windows PowerShell 5.1** deliberately. The target VM has
+no PowerShell 7, so that is what the runner invokes hooks with; a `??` in the
+sweep hook would have failed to parse on every job.
 The Linux entrypoint exports the cargo knobs before `run.sh`; a Windows service
 has no equivalent hook and the runner's `.env` is read only by the Linux
 systemd unit, so `provision.ps1` sets them as **machine-level** environment and

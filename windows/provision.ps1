@@ -94,6 +94,144 @@ function Warn  ($m) { Write-Host "!!  $m" -ForegroundColor Yellow }
 function Fail  ($m) { Write-Host "!!  $m" -ForegroundColor Red; exit 1 }
 
 # --------------------------------------------------------------------------
+# Job hooks
+#
+# Embedded rather than shipped as sibling files so this script is the ONLY
+# thing you need on a new machine: download it, run it, done. The trade is that
+# the hook sources live inside a here-string; they are single-quoted, so
+# nothing in them is expanded by this script.
+# --------------------------------------------------------------------------
+
+$JobStartedHook = @'
+<#
+  Runs before EVERY job, via ACTIONS_RUNNER_HOOK_JOB_STARTED.
+
+  The PowerShell twin of job-started-hook.sh, and it exists for exactly the
+  same reason. A shared setup snippet used across canvas-consuming repos
+  configures a git `insteadOf` rewrite with `git config --global set`, then
+  `--add` for a second value under the same key. On an ephemeral hosted runner
+  that is harmless -- the machine is destroyed when the job ends. Here the
+  service account outlives every job, so those values accumulate in its
+  .gitconfig until a later `set` collides with an already multi-valued key:
+
+      error: cannot overwrite multiple values with a single value
+
+  It is invisible in any one job and only appears once a machine has served
+  enough canvas-consuming jobs to pile up a second value.
+
+  This is a job-STARTED hook rather than only a completed one because a
+  cancelled, timed-out or killed job skips the completed hook entirely, and its
+  accumulated .gitconfig would survive into the next job -- which is the exact
+  collision being prevented. Running before every job closes the gap instead of
+  narrowing it.
+
+  "Clean baseline" means the file's absence: nothing in provision.ps1 writes a
+  .gitconfig for the service account, so that is what a freshly provisioned
+  machine starts with.
+#>
+$ErrorActionPreference = 'Continue'
+
+$gitconfig = Join-Path $env:USERPROFILE '.gitconfig'
+if (Test-Path $gitconfig) {
+  Remove-Item -Force $gitconfig -ErrorAction SilentlyContinue
+  Write-Host "hook: reset $gitconfig to a clean baseline"
+}
+
+# Never fail the job. This runs adjacent to work that must not be put at risk
+# by a cleanup step.
+exit 0
+'@
+
+$JobCompletedHook = @'
+<#
+  Runs after EVERY job, via ACTIONS_RUNNER_HOOK_JOB_COMPLETED.
+
+  The PowerShell twin of job-completed-hook.sh: bound `target/` between jobs so
+  a persistent machine does not drift until the disk fills. On the Linux fleet
+  that surfaced not as "out of disk" but as a linker bus error, which cost real
+  time to diagnose; a Windows machine will fail differently but no more
+  clearly.
+
+  The budget is higher here than the fleet's 4 GB because this is ONE machine
+  rather than twelve replicas sharing a volume, and because a Windows build
+  tree carries both the host and the cross target -- hbf builds
+  aarch64-pc-windows-msvc and x86_64-pc-windows-msvc from one checkout.
+
+  Why a job hook rather than a scheduled task: the runner invokes this between
+  jobs, so it can never delete a target/ out from under a live compile.
+
+  This bounds STEADY STATE, not the peak. A build in flight can exceed the
+  threshold and is only swept once it finishes.
+#>
+$ErrorActionPreference = 'Continue'
+
+# Written the long way rather than with `??`: the runner may invoke this hook
+# with Windows PowerShell 5.1, which has no null-coalescing operator and would
+# fail to parse the file outright.
+$maxGb = if ($env:SWEEP_MAX_GB) { [int]$env:SWEEP_MAX_GB } else { 8 }
+# The runner root's _work, NOT RUNNER_WORKSPACE. RUNNER_WORKSPACE is
+# per-repository, so using it would enforce the budget once per repo rather
+# than once per machine -- on the Linux fleet that let each replica hold twice
+# its nominal budget with two repos checked out.
+$workDir = if ($env:SWEEP_WORK_DIR) { $env:SWEEP_WORK_DIR } else { 'C:\actions-runner\_work' }
+if (-not (Test-Path $workDir)) { exit 0 }
+
+function Get-SizeMb($Path) {
+  try {
+    [Math]::Round((Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+      Measure-Object -Property Length -Sum).Sum / 1MB)
+  } catch { 0 }
+}
+
+$usedMb  = Get-SizeMb $workDir
+$limitMb = $maxGb * 1024
+if ($usedMb -le $limitMb) {
+  Write-Host "sweep: _work at $usedMb MB, under the $limitMb MB budget -- keeping it warm"
+  exit 0
+}
+
+Write-Host "sweep: _work at $usedMb MB exceeds $limitMb MB -- removing target dirs"
+
+# Largest first, stopping as soon as the budget is met, so the machine keeps as
+# much warmth as the budget allows instead of being emptied wholesale. Only
+# genuine cargo target dirs are touched: the CACHEDIR.TAG / debug / release
+# test avoids deleting a source directory that merely happens to be named
+# "target".
+$targets = Get-ChildItem -LiteralPath $workDir -Recurse -Directory -Force -Filter 'target' -ErrorAction SilentlyContinue |
+  Where-Object {
+    (Test-Path (Join-Path $_.FullName 'CACHEDIR.TAG')) -or
+    (Test-Path (Join-Path $_.FullName 'debug'))        -or
+    (Test-Path (Join-Path $_.FullName 'release'))
+  } |
+  ForEach-Object { [pscustomobject]@{ Path = $_.FullName; Mb = Get-SizeMb $_.FullName } } |
+  Sort-Object Mb -Descending
+
+foreach ($t in $targets) {
+  if ($usedMb -le $limitMb) { break }
+  Remove-Item -LiteralPath $t.Path -Recurse -Force -ErrorAction SilentlyContinue
+  $usedMb -= $t.Mb
+  Write-Host "sweep: removed $($t.Path) ($($t.Mb) MB), now ~$usedMb MB"
+}
+
+# Never fail the job: this runs after the work that matters is already done and
+# reported, and a sweep problem must not turn a green job red.
+exit 0
+'@
+
+function Write-HookFiles {
+  param([Parameter(Mandatory)][string] $Destination)
+  New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+  $a = Join-Path $Destination 'job-started-hook.ps1'
+  $b = Join-Path $Destination 'job-completed-hook.ps1'
+  # ASCII, not the default UTF-8-with-BOM of Set-Content on 5.1: a BOM ahead of
+  # the first line is tolerated by PowerShell but shows up in diffs and logs.
+  $JobStartedHook   | Set-Content -LiteralPath $a -Encoding ASCII
+  $JobCompletedHook | Set-Content -LiteralPath $b -Encoding ASCII
+  Info "Hooks written to $Destination"
+  return @($a, $b)
+}
+
+# --------------------------------------------------------------------------
 # Guardrails
 # --------------------------------------------------------------------------
 
@@ -171,7 +309,11 @@ Info "Registration API: $api"
 Info "Runner root    : $RunnerRoot (actions-runner $RunnerVersion)"
 
 if ($DryRun) {
-  Warn 'DryRun: nothing installed, nothing registered, no machine state changed.'
+  # The hooks go to TEMP rather than the runner root: it makes them
+  # inspectable (and testable) without writing anything the machine keeps.
+  $preview = Join-Path $env:TEMP 'jkur-provision-hooks'
+  Write-HookFiles -Destination $preview | Out-Null
+  Warn "DryRun: nothing installed, nothing registered, no service touched. Hooks emitted to $preview for inspection."
   exit 0
 }
 
@@ -298,13 +440,32 @@ if (-not $SkipToolchain) {
 
   # bun, for the UI bundle. hbf-gui's generate_context! embeds ui/build at
   # COMPILE time, so the bundle has to exist before cargo runs.
-  if (-not (Test-Cmd bun)) {
-    Info 'Installing bun'
-    # bun's own installer is the supported path on Windows and picks the right
-    # architecture itself.
-    Invoke-RestMethod 'https://bun.sh/install.ps1' | Invoke-Expression
+  # bun publishes a per-architecture zip for Windows, including aarch64, so it
+  # is fetched directly rather than by piping bun.sh/install.ps1 into
+  # Invoke-Expression: the zip is deterministic, works the same on both
+  # architectures, and does not execute a remote script as Administrator.
+  $bunDir = 'C:\Program Files\bun'
+  if (-not (Test-Path "$bunDir\bun.exe")) {
+    $bunArch = if ($isArm) { 'aarch64' } else { 'x64' }
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/oven-sh/bun/releases/latest'
+    $asset = $rel.assets | Where-Object { $_.name -eq "bun-windows-$bunArch.zip" } | Select-Object -First 1
+    if (-not $asset) { Fail "No bun-windows-$bunArch.zip in the latest bun release." }
+    $zip = Join-Path $tempDir "bun-$bunArch.zip"
+    Get-File $asset.browser_download_url $zip
+    $staging = Join-Path $tempDir 'bun-extract'
+    Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $zip -DestinationPath $staging -Force
+    New-Item -ItemType Directory -Force -Path $bunDir | Out-Null
+    # The zip nests everything under bun-windows-<arch>/.
+    Get-ChildItem -Recurse -File -Path $staging -Filter 'bun.exe' |
+      Select-Object -First 1 |
+      ForEach-Object { Copy-Item -Force $_.FullName "$bunDir\bun.exe" }
+    if (-not (Test-Path "$bunDir\bun.exe")) { Fail 'bun.exe not found inside the downloaded zip.' }
+    # An x64 machine older than the baseline cutoff needs
+    # bun-windows-x64-baseline.zip instead; bun will fail with an illegal
+    # instruction rather than a clear message if so.
   }
-  Add-MachinePath "$env:USERPROFILE\.bun\bin"
+  Add-MachinePath $bunDir
 
   # WebView2 is preinstalled on Windows 11. Checked rather than assumed,
   # because a missing runtime fails at GUI launch, long after the build.
@@ -406,14 +567,7 @@ try {
 
 $hooks = Join-Path $RunnerRoot 'hooks'
 New-Item -ItemType Directory -Force -Path $hooks | Out-Null
-foreach ($hook in 'job-started-hook.ps1','job-completed-hook.ps1') {
-  $src = Join-Path $PSScriptRoot $hook
-  # Copied from beside this script, so a lone provision.ps1 downloaded without
-  # the rest of windows/ fails here loudly rather than registering a runner
-  # whose hooks silently do not exist.
-  if (-not (Test-Path $src)) { Fail "Missing $hook next to provision.ps1 -- clone the repo rather than downloading the script alone." }
-  Copy-Item -Force $src $hooks
-}
+Write-HookFiles -Destination $hooks
 
 $machineEnv = @{
   # Same reasoning as entrypoint.sh: without a cap, cargo sizes its thread pool
