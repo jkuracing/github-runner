@@ -243,6 +243,92 @@ function Write-HookFiles {
 }
 
 # --------------------------------------------------------------------------
+# gh helpers
+#
+# gh writes to stderr in normal operation, and this script runs with
+# ErrorActionPreference = 'Stop', under which `2>&1` on a native command throws
+# NativeCommandError. Every gh call therefore goes through here, which relaxes
+# that for the duration and hands back the exit code plus clean text.
+# --------------------------------------------------------------------------
+
+function Invoke-Gh {
+  param(
+    [Parameter(Mandatory)][string[]] $GhArgs,
+    # Let gh own the console so it can prompt, print a device code, and open a
+    # browser. Output is not captured in this mode -- it belongs to the user.
+    [switch] $Interactive
+  )
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    if ($Interactive) {
+      & gh @GhArgs
+      return [pscustomobject]@{ Code = $LASTEXITCODE; Output = '' }
+    }
+    # ToString() per record: formatting an ErrorRecord wraps PowerShell's own
+    # "At <script>:<line> char:" trace around gh's one-line message.
+    $out = (& gh @GhArgs 2>&1 | ForEach-Object { $_.ToString() }) -join "`n"
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out.Trim() }
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+}
+
+function Test-Interactive {
+  # A provisioning run driven over `prlctl exec`, WinRM or a scheduled task has
+  # no console for gh to prompt on. Attempting it there hangs, which is worse
+  # than failing, so those sessions get printed instructions instead.
+  return [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+}
+
+function Get-GhRegistrationToken {
+  param(
+    [Parameter(Mandatory)][string] $ApiPath,
+    [Parameter(Mandatory)][string] $Scope
+  )
+
+  $manual = @"
+Run these on this machine, then re-run this script:
+
+    gh auth login --hostname github.com --scopes $Scope
+    <this script> -ServiceAccount '$ServiceAccount' -SkipToolchain
+
+Or skip gh entirely by passing -Pat, or -RegistrationToken if you minted one
+elsewhere.
+"@
+
+  $status = Invoke-Gh @('auth', 'status', '--hostname', 'github.com')
+  if ($status.Code -ne 0) {
+    Info 'gh is not logged in yet.'
+    if (-not (Test-Interactive)) { Fail "gh needs an interactive login and this session has no console.`n`n$manual" }
+    Info "Starting `gh auth login` -- follow its prompts (browser, or paste a token)."
+    $login = Invoke-Gh @('auth', 'login', '--hostname', 'github.com', '--scopes', $Scope) -Interactive
+    if ($login.Code -ne 0) { Fail "gh auth login exited $($login.Code).`n`n$manual" }
+  }
+
+  $attempt = Invoke-Gh @('api', '-X', 'POST', $ApiPath, '--jq', '.token')
+  if ($attempt.Code -eq 0 -and $attempt.Output -and $attempt.Output -notmatch '\s') {
+    return $attempt.Output
+  }
+
+  # Logged in but refused. Overwhelmingly this is the scope: gh's ordinary
+  # login grants read:org, while registering an org runner needs admin:org.
+  # Note an org that disables repo-level runners reports THAT as a 404 rather
+  # than a permission error, so the message keeps gh's own text.
+  Info "gh is logged in but could not mint a token; requesting the '$Scope' scope."
+  Info "  $($attempt.Output)"
+  if (-not (Test-Interactive)) { Fail "gh needs '$Scope' and this session has no console to grant it.`n`n$manual" }
+  $refresh = Invoke-Gh @('auth', 'refresh', '--hostname', 'github.com', '--scopes', $Scope) -Interactive
+  if ($refresh.Code -ne 0) { Fail "gh auth refresh exited $($refresh.Code).`n`n$manual" }
+
+  $attempt = Invoke-Gh @('api', '-X', 'POST', $ApiPath, '--jq', '.token')
+  if ($attempt.Code -ne 0 -or -not $attempt.Output -or $attempt.Output -match '\s') {
+    Fail "gh still could not mint a registration token from $ApiPath after granting '$Scope':`n`n  $($attempt.Output)`n`n$manual"
+  }
+  return $attempt.Output
+}
+
+# --------------------------------------------------------------------------
 # Guardrails
 # --------------------------------------------------------------------------
 
@@ -272,14 +358,44 @@ if (-not $Pat -and -not $RegistrationToken -and -not $SkipRegistration -and -not
 # "The specified account does not exist" buried in runner output.
 $acctName = $ServiceAccount -replace '^\.\\', ''
 if ($ServiceAccount -like '.\*' -and -not (Get-LocalUser -Name $acctName -ErrorAction SilentlyContinue)) {
-  Fail @"
-Local account '$acctName' does not exist. Create it yourself (it needs a password you choose), then re-run:
+  $createHint = @"
+Create it yourself, then re-run:
 
     New-LocalUser -Name '$acctName' -Description 'GitHub Actions runner' -PasswordNeverExpires
 
 config.cmd grants it SeServiceLogonRight when it installs the service, so no
 manual rights assignment is needed.
 "@
+  if (-not (Test-Interactive)) {
+    Fail "Local account '$acctName' does not exist, and this session has no console to create it on.`n`n$createHint"
+  }
+  Warn "Local account '$acctName' does not exist."
+  $answer = Read-Host "Create it now? The password is yours to choose and is never shown, logged or stored by this script [y/N]"
+  if ($answer -notmatch '^(y|yes)$') { Fail $createHint }
+
+  # Read twice and compare. A mistyped password here does not fail here -- it
+  # fails later, as a service that installs cleanly and then refuses to start,
+  # which is a much worse place to discover a typo.
+  $pw1 = Read-Host 'Password for the runner account' -AsSecureString
+  $pw2 = Read-Host 'Confirm password' -AsSecureString
+  $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw1)
+  $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw2)
+  try {
+    $s1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
+    $s2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
+    $match = $s1 -ceq $s2
+  } finally {
+    # Zero both copies rather than waiting for the GC: BSTRs are unmanaged and
+    # would otherwise sit in memory for the rest of the run.
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2)
+  }
+  if (-not $match) { Fail 'The two passwords do not match.' }
+
+  New-LocalUser -Name $acctName -Password $pw1 -Description 'GitHub Actions runner' `
+                -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
+  Info "Created local account '$acctName'."
+  Warn 'config.cmd will ask for this password again shortly. That second prompt is deliberate: it keeps the password inside the runner rather than on a command line.'
 }
 
 if (-not $RunnerVersion) {
@@ -588,48 +704,18 @@ if ($SkipRegistration) {
     }
     $token = $resp.token
   } else {
-    # No PAT: let the GitHub CLI mint it from whatever credential it already
-    # holds. Preferable to a classic PAT -- gh's token is managed, revocable
-    # and not copy-pasted through a shell -- but it needs the right scope,
-    # which gh will NOT have by default: its standard login grants read:org,
-    # while registering an org runner needs admin:org.
-    if (-not (Test-Cmd gh)) {
-      Fail 'No -Pat, no -RegistrationToken, and gh is not on PATH. Install gh (this script does, unless -SkipToolchain), or pass a credential.'
+    # No PAT and no pre-minted token: let the GitHub CLI handle it, logging in
+    # or widening its scope interactively if it has to. This is the path an
+    # empty machine takes -- nothing to create beforehand, and gh's credential
+    # is managed and revocable rather than a classic PAT pasted through a
+    # shell.
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+      Fail 'gh is not on PATH. Drop -SkipToolchain so this script installs it, or pass -Pat / -RegistrationToken.'
     }
-    Info 'Requesting a registration token via gh'
-    $apiPath = $api -replace '^https://api\.github\.com/', ''
-    # ErrorActionPreference is 'Stop' for this script, and under it PowerShell
-    # turns a native command's stderr into a thrown NativeCommandError -- which
-    # would bury the actionable guidance below under a parser trace. Relaxed
-    # just for this call so gh's own message can be captured as text.
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    # ToString() per record, not a bare Out-String: `2>&1` yields ErrorRecords,
-    # and formatting those renders PowerShell's own "At <script>:<line> char:"
-    # trace around gh's message -- noise in what is meant to be a readable
-    # instruction.
-    $ghOut = (& gh api -X POST $apiPath --jq '.token' 2>&1 |
-                ForEach-Object { $_.ToString() }) -join "`n"
-    $ghOut = $ghOut.Trim()
-    $ghCode = $LASTEXITCODE
-    $ErrorActionPreference = $prevEap
-    $token = $ghOut
-    if ($ghCode -ne 0 -or -not $token -or $token -match '\s') {
-      Fail @"
-gh could not mint a registration token from $apiPath.
-
-  $ghOut
-
-If that says the operation needs a scope, grant it once and re-run:
-
-    gh auth refresh -h github.com -s admin:org
-
-(admin:org is for an ORG runner. A repo-scoped runner -- pass
--Url https://github.com/<owner>/<repo> -- needs admin on that repo instead,
-and some orgs disable repo-level runners entirely, which the API reports as a
-404 rather than a permission error.)
-"@
-    }
+    # An org runner needs admin:org; a repo runner needs admin on the repo,
+    # which the `repo` scope carries.
+    $ghScope = if ($parts.Count -ge 2) { 'repo' } else { 'admin:org' }
+    $token = Get-GhRegistrationToken -ApiPath ($api -replace '^https://api\.github\.com/', '') -Scope $ghScope
   }
 
   Push-Location $RunnerRoot
