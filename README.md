@@ -143,52 +143,76 @@ provisioning, and it is idempotent -- re-running it upgrades the toolchain and
 re-registers against a freshly minted token, which is the intended way to
 update a machine rather than only to build one.
 
-`provision.ps1` is **one self-contained file**. It needs nothing else from
-this repo -- the job hooks are embedded and written out during provisioning --
-so it can be copied to a new machine on its own, and it handles x64 and ARM64
-identically.
+`provision.ps1` is **one self-contained file** and the whole procedure. It
+needs nothing else from this repo -- the job hooks are embedded and written out
+during provisioning -- and it handles x64 and ARM64 identically.
+
+On a blank Windows machine, in an **elevated** PowerShell:
 
 ```powershell
-# Elevated PowerShell, on the machine that will run jobs.
-
-# Preview everything it would derive, without touching the machine:
+# See exactly what it would do, without touching anything:
 .\provision.ps1 -ServiceAccount '.\ci' -DryRun
 
 # Then for real:
 .\provision.ps1 -ServiceAccount '.\ci'
 ```
 
-### Credentials: gh, a PAT, or a token minted elsewhere
-
-Registration needs a short-lived token, and there are three ways to get one.
-They are tried in that order:
-
-1. **`-RegistrationToken` / `RUNNER_TOKEN`** — one you minted elsewhere. This
-   is what keeps a PAT off the provisioned machine entirely: mint it where the
-   credential already lives, pass only the ~1h result.
-2. **`-Pat` / `GITHUB_PAT`** — a classic PAT, as the Linux `entrypoint.sh`
-   takes.
-3. **`gh`** — nothing to pass at all. The script installs the GitHub CLI and
-   asks it to mint the token, which beats a hand-made PAT: gh's credential is
-   managed and revocable rather than pasted through a shell.
-
-Option 3 needs one grant, because gh's ordinary login gives `read:org` while
-registering an **org** runner needs `admin:org`:
-
-```powershell
-gh auth refresh -h github.com -s admin:org
-```
-
-A **repo**-scoped runner (`-Url https://github.com/<owner>/<repo>`) needs admin
-on that repo instead — but note some orgs disable repo-level runners, and the
-API reports that as a `404` rather than a permission error.
-
-Or fetch just that file onto a fresh machine:
+Or fetch just that file onto a fresh machine first:
 
 ```powershell
 $u = 'https://raw.githubusercontent.com/jkuracing/github-runner/main/windows/provision.ps1'
 Invoke-WebRequest $u -OutFile provision.ps1 -UseBasicParsing
 ```
+
+That single run installs the toolchain, offers to create the service account,
+logs in to GitHub, registers the runner as a service and starts it. Nothing
+needs preparing beforehand -- no PAT to mint, no account to create.
+
+It prompts for exactly two things, both yours, neither stored or displayed by
+the script:
+
+- **the runner account's password**, if the account does not exist yet and you
+  ask it to create one. Read twice and compared, because a typo here does not
+  fail here -- it fails later, as a service that installs cleanly and then
+  refuses to start.
+- **your GitHub login**, through `gh`'s own flow.
+
+`config.cmd` then asks for the account password a second time. That is
+deliberate rather than an oversight: it keeps the password inside the runner
+instead of on a command line, where `--windowslogonpassword` would put it.
+
+### Unattended runs
+
+Every interactive path degrades to a printed instruction rather than a hang,
+which matters because a `prlctl exec`, WinRM or scheduled-task session has no
+console for `gh` to prompt on, and a hang there is worse than a failure.
+Detection is `[Environment]::UserInteractive -and -not [Console]::IsInputRedirected`.
+
+For those sessions, split the run:
+
+```powershell
+# Long and unattended: toolchain only.
+.\provision.ps1 -ServiceAccount '.\ci' -SkipRegistration
+
+# Short and interactive, on the machine itself.
+.\provision.ps1 -ServiceAccount '.\ci' -SkipToolchain
+```
+
+### Credentials
+
+Registration tries, in order: `-RegistrationToken` / `RUNNER_TOKEN`, then
+`-Pat` / `GITHUB_PAT`, then `gh`. The gh path is the default and the one worth
+using -- its credential is managed and revocable rather than a classic PAT
+pasted through a shell. `-RegistrationToken` is the one that keeps a PAT off
+the provisioned machine entirely: mint it where the credential already lives
+and pass only the ~1h result.
+
+gh's ordinary login carries `read:org` while registering an **org** runner
+needs `admin:org`, so the script asks gh to widen its own scope when a mint is
+refused rather than telling you to. A **repo**-scoped runner
+(`-Url https://github.com/<owner>/<repo>`) needs admin on that repo instead,
+and an org that disables repo-level runners reports that as a `404` rather than
+a permission error.
 
 ### The service account is not optional, and must not be SYSTEM
 
