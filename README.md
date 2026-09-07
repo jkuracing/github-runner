@@ -219,10 +219,18 @@ Set up runner   . : File C:\actions-runner\hooks\job-started-hook.ps1 cannot
                 ##[error]Process completed with exit code 1.
 ```
 
-So `ACTIONS_RUNNER_HOOK_JOB_STARTED` / `_COMPLETED` point at generated `.cmd`
-wrappers instead. A `.cmd` hook runs through `cmd.exe`, where no execution
-policy applies, and it re-invokes the `.ps1` with the bypass. Both the wrappers
+So `ACTIONS_RUNNER_HOOK_JOB_STARTED` / `_COMPLETED` point at generated `.sh`
+wrappers instead, which re-invoke the `.ps1` with the bypass. Both the wrappers
 and the scripts live in `<RunnerRoot>\hooks\`.
+
+`.sh` specifically, not `.cmd`: the runner accepts only `.sh`, `.ps1` or `.js`
+and rejects anything else with *"is not a valid path to a script"*. bash is
+guaranteed here regardless, since Git for Windows is already mandatory for
+`shell: bash` steps. The wrappers hardcode the absolute Windows path rather
+than deriving it from `$0`, because Git Bash reports a POSIX path
+(`/c/actions-runner/...`) that `powershell -File` cannot resolve, and they are
+written with LF endings -- a shell script with CRLF fails as a confusing
+"not found".
 
 ### Unattended runs
 
