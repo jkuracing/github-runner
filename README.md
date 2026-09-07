@@ -325,6 +325,7 @@ Established empirically against hbf rather than from vendor docs:
 | bun | `hbf-gui`'s `generate_context!` embeds `ui/build` at *compile* time. |
 | WebView2 | Preinstalled on Windows 11; checked, not assumed. |
 | `gh` | Mints the runner registration token, so no PAT is needed. |
+| `uv` + CPython | Workflow steps assume Python: `publish-gui.yml` resolves the workspace version with `python3 -c 'import tomllib...'`. Installed machine-wide via `UV_PYTHON_INSTALL_DIR`, with a `python3.exe` copy beside `python.exe` because Windows CPython ships only the latter while every step written for Linux says `python3`. |
 | `jq` | The shared `vs-registry-auth` action parses the registry config with it. Absent, that check fails as *"returned 200 but not the registry config (SSO page?)"* — pointing at the registry rather than at the missing binary. Linux gets jq from its base packages, so this gap is Windows-only. |
 
 `winget` is deliberately unused -- it hangs under a non-interactive remote

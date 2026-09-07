@@ -84,6 +84,7 @@ param(
   # explicitly only to reproduce a specific machine.
   [string] $RunnerVersion  = '',
   [int]    $BuildJobs      = 0,
+  [string] $PythonVersion  = '3.12',
   [switch] $SkipToolchain,
   # Skip the registration step and stop after the toolchain. config.cmd prompts
   # for the service account password on an interactive console, so a session
@@ -713,6 +714,61 @@ if (-not $SkipToolchain) {
     Get-File $asset.browser_download_url "$jqDir\jq.exe"
   }
   Add-MachinePath $jqDir
+
+  # uv, and a CPython for it to manage. The Linux image carries Python 3.12
+  # and uv, and workflow steps assume it -- publish-gui.yml resolves the
+  # workspace version with `python3 -c 'import tomllib...'`, which is a
+  # `command not found` here otherwise.
+  #
+  # uv rather than the python.org installer: one binary with a predictable
+  # per-architecture asset (including aarch64-pc-windows-msvc), no silent-install
+  # flags to get wrong, and the same tool the Linux side already uses.
+  $uvDir = 'C:\Program Files\uv'
+  if (-not (Test-Path "$uvDir\uv.exe")) {
+    $uvArch = if ($isArm) { 'aarch64' } else { 'x86_64' }
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/astral-sh/uv/releases/latest'
+    $asset = $rel.assets | Where-Object { $_.name -eq "uv-$uvArch-pc-windows-msvc.zip" } | Select-Object -First 1
+    if (-not $asset) { Fail "No uv-$uvArch-pc-windows-msvc.zip in the latest uv release." }
+    $zip = Join-Path $tempDir "uv-$uvArch.zip"
+    Get-File $asset.browser_download_url $zip
+    $staging = Join-Path $tempDir 'uv-extract'
+    Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $zip -DestinationPath $staging -Force
+    New-Item -ItemType Directory -Force -Path $uvDir | Out-Null
+    Get-ChildItem -Recurse -File -Path $staging -Filter 'uv*.exe' |
+      ForEach-Object { Copy-Item -Force $_.FullName (Join-Path $uvDir $_.Name) }
+    if (-not (Test-Path "$uvDir\uv.exe")) { Fail 'uv.exe not found inside the downloaded zip.' }
+  }
+  Add-MachinePath $uvDir
+
+  # Machine-wide, for the same reason CARGO_HOME is: uv's default install dir
+  # is under %LOCALAPPDATA%, so provisioning elevated would put Python in the
+  # provisioning account's profile where the service account cannot see it.
+  $pyRoot = 'C:\python'
+  [Environment]::SetEnvironmentVariable('UV_PYTHON_INSTALL_DIR', $pyRoot, 'Machine')
+  $env:UV_PYTHON_INSTALL_DIR = $pyRoot
+  New-Item -ItemType Directory -Force -Path $pyRoot | Out-Null
+
+  $pyExe = Get-ChildItem -Path $pyRoot -Recurse -Filter 'python.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $pyExe) {
+    Info "Installing CPython $PythonVersion into $pyRoot"
+    & "$uvDir\uv.exe" python install $PythonVersion
+    $pyExe = Get-ChildItem -Path $pyRoot -Recurse -Filter 'python.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pyExe) { Fail "uv reported success but no python.exe appeared under $pyRoot." }
+  }
+
+  # Windows CPython ships python.exe and no python3.exe, while every workflow
+  # step written for Linux/macOS says `python3`. Git Bash resolves that by
+  # looking for python3.exe on PATH, so provide one.
+  $py3 = Join-Path $pyExe.Directory.FullName 'python3.exe'
+  if (-not (Test-Path $py3)) { Copy-Item -Force $pyExe.FullName $py3 }
+  Add-MachinePath $pyExe.Directory.FullName
+
+  $pyAcl = Get-Acl $pyRoot
+  $pyAcl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+    $aclIdentity, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  Set-Acl -Path $pyRoot -AclObject $pyAcl
+  Info "Python at $($pyExe.FullName) (python3.exe alongside it)"
 
   # WebView2 is preinstalled on Windows 11. Checked rather than assumed,
   # because a missing runtime fails at GUI launch, long after the build.
