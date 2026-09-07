@@ -151,11 +151,20 @@ On a blank Windows machine, in an **elevated** PowerShell:
 
 ```powershell
 # See exactly what it would do, without touching anything:
-.\provision.ps1 -ServiceAccount '.\ci' -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
+    -ServiceAccount '.\ci' -DryRun
 
 # Then for real:
-.\provision.ps1 -ServiceAccount '.\ci'
+powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
+    -ServiceAccount '.\ci'
 ```
+
+**`-ExecutionPolicy Bypass` is not decoration.** A default Windows install
+refuses to run an unsigned `.ps1` invoked by path, with
+`PSSecurityException: running scripts is disabled on this system`. Passing it
+on the `powershell.exe` command line scopes the exemption to that single
+process, which is why the script is invoked this way rather than asking you to
+change the machine's policy.
 
 Or fetch just that file onto a fresh machine first:
 
@@ -192,10 +201,12 @@ For those sessions, split the run:
 
 ```powershell
 # Long and unattended: toolchain only.
-.\provision.ps1 -ServiceAccount '.\ci' -SkipRegistration
+powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
+    -ServiceAccount '.\ci' -SkipRegistration
 
 # Short and interactive, on the machine itself.
-C:\actions-runner\provision.ps1 -ServiceAccount '.\ci' -SkipToolchain
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\actions-runner\provision.ps1 `
+    -ServiceAccount '.\ci' -SkipToolchain
 ```
 
 The script installs a copy of itself at `<RunnerRoot>\provision.ps1`, so the

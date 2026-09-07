@@ -810,8 +810,12 @@ if ($SkipRegistration) {
   Info 'on the machine itself -- config.cmd prompts for the account password on'
   Info 'an interactive console, which a remote or scripted session cannot answer:'
   Info ''
-  Info "    `$env:GITHUB_PAT = '<classic PAT>'"
-  Info "    $selfTarget -ServiceAccount '$ServiceAccount' -SkipToolchain"
+  Info "    powershell -NoProfile -ExecutionPolicy Bypass -File $selfTarget ``"
+  Info "        -ServiceAccount '$ServiceAccount' -SkipToolchain"
+  Info ''
+  Info 'The -ExecutionPolicy Bypass is not optional on a default Windows'
+  Info 'install: RemoteSigned/Restricted refuses an unsigned .ps1 invoked by'
+  Info 'path. It applies to that one process only and changes nothing.'
   Info ''
   exit 0
 }
