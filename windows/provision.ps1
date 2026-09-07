@@ -769,6 +769,21 @@ if ($SkipRegistration) {
 # The service picks these up at start, which is why it is restarted below.
 # --------------------------------------------------------------------------
 
+# Install this script beside the runner it provisions.
+#
+# Re-running is how a machine is upgraded, and the copy you first ran from is
+# often somewhere temporary -- a Downloads folder, a network share, a checkout
+# that gets deleted. Landing a copy at a stable, predictable path means the
+# upgrade command is the same on every machine and does not depend on where the
+# operator happened to be standing.
+$selfSource = $PSCommandPath
+$selfTarget = Join-Path $RunnerRoot 'provision.ps1'
+if ($selfSource -and (Test-Path $selfSource) -and
+    ((Resolve-Path $selfSource).Path -ne (Join-Path (Resolve-Path $RunnerRoot).Path 'provision.ps1'))) {
+  Copy-Item -Force -LiteralPath $selfSource -Destination $selfTarget
+  Info "Installed this script to $selfTarget"
+}
+
 $hooks = Join-Path $RunnerRoot 'hooks'
 New-Item -ItemType Directory -Force -Path $hooks | Out-Null
 Write-HookFiles -Destination $hooks | Out-Null
@@ -796,7 +811,7 @@ if ($SkipRegistration) {
   Info 'an interactive console, which a remote or scripted session cannot answer:'
   Info ''
   Info "    `$env:GITHUB_PAT = '<classic PAT>'"
-  Info "    $($MyInvocation.MyCommand.Path) -ServiceAccount '$ServiceAccount' -SkipToolchain"
+  Info "    $selfTarget -ServiceAccount '$ServiceAccount' -SkipToolchain"
   Info ''
   exit 0
 }

@@ -195,8 +195,12 @@ For those sessions, split the run:
 .\provision.ps1 -ServiceAccount '.\ci' -SkipRegistration
 
 # Short and interactive, on the machine itself.
-.\provision.ps1 -ServiceAccount '.\ci' -SkipToolchain
+C:\actions-runner\provision.ps1 -ServiceAccount '.\ci' -SkipToolchain
 ```
+
+The script installs a copy of itself at `<RunnerRoot>\provision.ps1`, so the
+second half -- and any later upgrade -- is the same command on every machine,
+regardless of where the first half was run from.
 
 ### Credentials
 
