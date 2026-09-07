@@ -72,9 +72,18 @@ param(
   [string] $Name           = "win-$env:COMPUTERNAME",
   [string] $Labels         = '',
   [string] $RunnerRoot     = 'C:\actions-runner',
-  [string] $RunnerVersion  = '2.331.0',
+  # Empty means "resolve the latest release at run time", which is what every
+  # other download here does. A hand-pinned version only goes stale: the runner
+  # self-updates on first contact with GitHub anyway, so pinning buys nothing
+  # and guarantees the first job runs on a just-replaced binary. Set it
+  # explicitly only to reproduce a specific machine.
+  [string] $RunnerVersion  = '',
   [int]    $BuildJobs      = 0,
-  [switch] $SkipToolchain
+  [switch] $SkipToolchain,
+  # Print everything this run would derive, then exit without touching the
+  # machine. Worth having before provisioning a box you care about, and it is
+  # how the derivation below is tested without side effects.
+  [switch] $DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,6 +127,14 @@ manual rights assignment is needed.
 "@
 }
 
+if (-not $RunnerVersion) {
+  try {
+    $RunnerVersion = (Invoke-RestMethod 'https://api.github.com/repos/actions/runner/releases/latest').tag_name -replace '^v', ''
+  } catch {
+    Fail "Could not resolve the latest actions/runner release: $_. Pass -RunnerVersion to pin one."
+  }
+}
+
 $arch = $env:PROCESSOR_ARCHITECTURE
 switch ($arch) {
   'ARM64' { $runnerArch = 'arm64'; $isArm = $true }
@@ -134,11 +151,29 @@ if ($BuildJobs -le 0) {
   $BuildJobs = [Math]::Max(1, [Math]::Floor($cpus / 2))
 }
 
+# Derived here rather than at point of use so -DryRun can show it. Mirrors
+# fetch_runner_token in entrypoint.sh: org URLs hit /orgs/{org}/..., repo URLs
+# /repos/{owner}/{repo}/.... Pure string work -- no network call happens here.
+$path  = ($Url -replace '^https://github\.com/', '').TrimEnd('/')
+$parts = $path.Split('/')
+$api = if ($parts.Count -ge 2) {
+  "https://api.github.com/repos/$($parts[0])/$($parts[1])/actions/runners/registration-token"
+} else {
+  "https://api.github.com/orgs/$($parts[0])/actions/runners/registration-token"
+}
+
 Info "Architecture   : $arch (runner package: $runnerArch)"
 Info "Runner name    : $Name"
 Info "Labels         : $Labels"
 Info "Service account: $ServiceAccount"
 Info "CARGO_BUILD_JOBS: $BuildJobs"
+Info "Registration API: $api"
+Info "Runner root    : $RunnerRoot (actions-runner $RunnerVersion)"
+
+if ($DryRun) {
+  Warn 'DryRun: nothing installed, nothing registered, no machine state changed.'
+  exit 0
+}
 
 # --------------------------------------------------------------------------
 # Toolchain
@@ -307,16 +342,6 @@ $rule = New-Object Security.AccessControl.FileSystemAccessRule(
   $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
 $acl.SetAccessRule($rule)
 Set-Acl -Path $RunnerRoot -AclObject $acl
-
-# Mint a fresh registration token. Mirrors fetch_runner_token in entrypoint.sh:
-# org URLs hit /orgs/{org}/..., repo URLs /repos/{owner}/{repo}/....
-$path = ($Url -replace '^https://github\.com/', '').TrimEnd('/')
-$parts = $path.Split('/')
-$api = if ($parts.Count -ge 2) {
-  "https://api.github.com/repos/$($parts[0])/$($parts[1])/actions/runners/registration-token"
-} else {
-  "https://api.github.com/orgs/$($parts[0])/actions/runners/registration-token"
-}
 
 Info 'Requesting a registration token'
 try {
