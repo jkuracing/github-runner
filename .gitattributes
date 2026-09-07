@@ -1,2 +1,7 @@
 # Force all .sh files to use LF (Unix) line endings
 *.sh text eol=lf
+# PowerShell and batch are Windows-native; keep CRLF so they read correctly
+# in Notepad and are byte-identical to what is executed on the runner.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

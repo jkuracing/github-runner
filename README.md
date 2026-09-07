@@ -1,6 +1,8 @@
-# Dockerized self-hosted GitHub Runner
+# Self-hosted GitHub Runners
 
-A self-hosted GitHub Actions runner Docker image configured for JKU Racing firmware development.
+Self-hosted GitHub Actions runners configured for JKU Racing firmware
+development: a Docker image for Linux (`amd64`/`arm64`), and a native
+PowerShell provisioning script for Windows (see [Windows runners](#windows-runners)).
 
 ## Pre-installed Tools
 
@@ -131,3 +133,85 @@ docker compose up -d --build
 > Always pass `--build`. Plain `docker compose up -d` only builds when the image
 > is missing, so it will happily keep running a stale image after the Dockerfile
 > or `entrypoint.sh` changes.
+
+## Windows runners
+
+Linux runs in Docker; Windows does not. Windows containers cannot run on the
+ARM64 Parallels VM this targets, so a Windows runner is provisioned natively
+onto a machine that is set up once and kept. `windows/provision.ps1` is that
+provisioning, and it is idempotent -- re-running it upgrades the toolchain and
+re-registers against a freshly minted token, which is the intended way to
+update a machine rather than only to build one.
+
+```powershell
+# Elevated PowerShell, on the machine that will run jobs.
+$env:GITHUB_PAT = '<classic PAT with admin:org>'
+.\windows\provision.ps1 -ServiceAccount '.\ci'
+```
+
+### The service account is not optional, and must not be SYSTEM
+
+`config.cmd` prompts for the account's password itself, so it never reaches a
+command line, an environment variable, or this repo. Create the account first
+(you choose the password); the script refuses to invent one:
+
+```powershell
+New-LocalUser -Name 'ci' -Description 'GitHub Actions runner' -PasswordNeverExpires
+```
+
+Running jobs as LocalSystem is rejected outright, because two independent
+things break under it and both were found the hard way:
+
+- tauri caches its NSIS toolchain under `%LOCALAPPDATA%\tauri\NSIS`. Under
+  SYSTEM that resolves inside `systemprofile`, the download reports success,
+  nothing lands, and the bundler dies with `Unable to start child process,
+  error 0x2` -- which is `ERROR_FILE_NOT_FOUND`, not the x86-emulation failure
+  it reads as.
+- `node_modules` created by a SYSTEM build is owned by SYSTEM, and any later
+  build under another account hangs or fails `EPERM` on it.
+
+### Architecture
+
+The runner is labelled by what the machine **is** (`windows-arm64` or
+`windows-x64`), not by what it builds. An ARM64 Windows box cross-compiles
+`x86_64-pc-windows-msvc` perfectly well -- verified end to end, including an
+NSIS installer whose payload is PE machine `0x8664` -- so labelling an ARM64
+machine `windows-x64` would be a lie that breaks the first time a real x64
+machine joins.
+
+`makensis.exe` is a 32-bit x86 binary and runs under ARM64's emulation, the
+same way the amd64-only `pkl` this toolchain installs does. Nothing about the
+Windows packaging path requires an x64 host.
+
+### Toolchain
+
+Established empirically against hbf rather than from vendor docs:
+
+| Tool | Why |
+|------|-----|
+| Git for Windows | **Required.** Every composite action these workflows use declares `shell: bash`, which resolves to `bash.exe` on PATH. Without it the runner registers and then fails every job. |
+| VS Build Tools | The MSVC linker. `*-pc-windows-msvc` cannot link without it. |
+| Rust + both MSVC targets | Either direction of cross-compilation from one machine. |
+| `cargo-nextest` | hbf's suite needs it; plain `cargo test` produces phantom 30s timeouts. |
+| clang (LLVM) | **ARM64 only** -- `ring` assembles its crypto with it there. x64 links with MSVC alone. |
+| Pkl | A build script shells out to it. No ARM64 build exists; the amd64 exe runs emulated. |
+| bun | `hbf-gui`'s `generate_context!` embeds `ui/build` at *compile* time. |
+| WebView2 | Preinstalled on Windows 11; checked, not assumed. |
+
+`winget` is deliberately unused -- it hangs under a non-interactive remote
+session on this VM, so every install is `curl` plus a silent installer.
+
+### Hooks and machine environment
+
+`windows/job-started-hook.ps1` and `windows/job-completed-hook.ps1` are the
+PowerShell twins of the `.sh` hooks, for the same reasons: resetting an
+accumulating `.gitconfig` before each job, and bounding `target/` after it.
+The Linux entrypoint exports the cargo knobs before `run.sh`; a Windows service
+has no equivalent hook and the runner's `.env` is read only by the Linux
+systemd unit, so `provision.ps1` sets them as **machine-level** environment and
+restarts the service to pick them up.
+
+`CARGO_BUILD_JOBS` defaults to half the CPUs rather than all of them. This VM
+is expected to share a host with other work, and an unthrottled Windows build
+starves the OrbStack Linux fleet badly enough that its runners drop with "lost
+communication".
