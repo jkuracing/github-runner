@@ -150,7 +150,6 @@ identically.
 
 ```powershell
 # Elevated PowerShell, on the machine that will run jobs.
-$env:GITHUB_PAT = '<classic PAT with admin:org>'
 
 # Preview everything it would derive, without touching the machine:
 .\provision.ps1 -ServiceAccount '.\ci' -DryRun
@@ -158,6 +157,31 @@ $env:GITHUB_PAT = '<classic PAT with admin:org>'
 # Then for real:
 .\provision.ps1 -ServiceAccount '.\ci'
 ```
+
+### Credentials: gh, a PAT, or a token minted elsewhere
+
+Registration needs a short-lived token, and there are three ways to get one.
+They are tried in that order:
+
+1. **`-RegistrationToken` / `RUNNER_TOKEN`** — one you minted elsewhere. This
+   is what keeps a PAT off the provisioned machine entirely: mint it where the
+   credential already lives, pass only the ~1h result.
+2. **`-Pat` / `GITHUB_PAT`** — a classic PAT, as the Linux `entrypoint.sh`
+   takes.
+3. **`gh`** — nothing to pass at all. The script installs the GitHub CLI and
+   asks it to mint the token, which beats a hand-made PAT: gh's credential is
+   managed and revocable rather than pasted through a shell.
+
+Option 3 needs one grant, because gh's ordinary login gives `read:org` while
+registering an **org** runner needs `admin:org`:
+
+```powershell
+gh auth refresh -h github.com -s admin:org
+```
+
+A **repo**-scoped runner (`-Url https://github.com/<owner>/<repo>`) needs admin
+on that repo instead — but note some orgs disable repo-level runners, and the
+API reports that as a `404` rather than a permission error.
 
 Or fetch just that file onto a fresh machine:
 

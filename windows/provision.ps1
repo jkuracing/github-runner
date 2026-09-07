@@ -258,8 +258,14 @@ if ($ServiceAccount -match '^(NT AUTHORITY\\)?(LocalSystem|SYSTEM)$') {
   Fail 'ServiceAccount must not be LocalSystem: tauri''s NSIS cache and node_modules ownership both break under it. Use a dedicated local account.'
 }
 
-if (-not $Pat -and -not $RegistrationToken -and -not $SkipRegistration) {
-  Fail 'No credential. Pass -Pat/GITHUB_PAT (classic PAT: admin:org for an org runner, repo for a repo runner), or -RegistrationToken/RUNNER_TOKEN if you minted one elsewhere, or -SkipRegistration to install only the toolchain.'
+# gh counts as a credential: it can mint the registration token itself. Checked
+# with Get-Command rather than the Test-Cmd helper because that is defined with
+# the toolchain further down, and -SkipToolchain must still reach this. gh may
+# also be installed BY this run, so a missing gh is only fatal when the
+# toolchain step is being skipped.
+$haveGh = $null -ne (Get-Command gh -ErrorAction SilentlyContinue)
+if (-not $Pat -and -not $RegistrationToken -and -not $SkipRegistration -and -not $haveGh -and $SkipToolchain) {
+  Fail 'No credential and no gh. Pass -Pat/GITHUB_PAT, or -RegistrationToken/RUNNER_TOKEN if you minted one elsewhere, or drop -SkipToolchain so gh gets installed, or -SkipRegistration to install only the toolchain.'
 }
 
 # Fail early and clearly rather than at config.cmd time, where the error is
@@ -512,6 +518,29 @@ if (-not $SkipToolchain) {
   }
   Add-MachinePath $bunDir
 
+  # GitHub CLI. Not needed to build anything -- it is here so registration can
+  # use `gh auth` instead of a hand-made classic PAT (see Get-RegistrationToken
+  # below), and because a CI box is a place you end up wanting it.
+  $ghDir = 'C:\Program Files\gh'
+  if (-not (Test-Path "$ghDir\gh.exe")) {
+    $ghArch = if ($isArm) { 'arm64' } else { 'amd64' }
+    $rel = Invoke-RestMethod 'https://api.github.com/repos/cli/cli/releases/latest'
+    $asset = $rel.assets | Where-Object { $_.name -like "gh_*_windows_$ghArch.zip" } | Select-Object -First 1
+    if (-not $asset) { Fail "No gh_*_windows_$ghArch.zip in the latest gh release." }
+    $zip = Join-Path $tempDir "gh-$ghArch.zip"
+    Get-File $asset.browser_download_url $zip
+    $staging = Join-Path $tempDir 'gh-extract'
+    Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $zip -DestinationPath $staging -Force
+    New-Item -ItemType Directory -Force -Path $ghDir | Out-Null
+    # The zip nests everything under gh_<version>_windows_<arch>/bin/.
+    Get-ChildItem -Recurse -File -Path $staging -Filter 'gh.exe' |
+      Select-Object -First 1 |
+      ForEach-Object { Copy-Item -Force $_.FullName "$ghDir\gh.exe" }
+    if (-not (Test-Path "$ghDir\gh.exe")) { Fail 'gh.exe not found inside the downloaded zip.' }
+  }
+  Add-MachinePath $ghDir
+
   # WebView2 is preinstalled on Windows 11. Checked rather than assumed,
   # because a missing runtime fails at GUI launch, long after the build.
   $wv = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
@@ -547,8 +576,8 @@ if ($SkipRegistration) {
   if ($RegistrationToken) {
     Info 'Using the registration token supplied on the command line'
     $token = $RegistrationToken
-  } else {
-    Info 'Requesting a registration token'
+  } elseif ($Pat) {
+    Info 'Requesting a registration token with the supplied PAT'
     try {
       $resp = Invoke-RestMethod -Method Post -Uri $api -Headers @{
         Authorization = "Bearer $Pat"
@@ -558,6 +587,49 @@ if ($SkipRegistration) {
       Fail "Could not mint a registration token from $api -- check the PAT's scopes. $_"
     }
     $token = $resp.token
+  } else {
+    # No PAT: let the GitHub CLI mint it from whatever credential it already
+    # holds. Preferable to a classic PAT -- gh's token is managed, revocable
+    # and not copy-pasted through a shell -- but it needs the right scope,
+    # which gh will NOT have by default: its standard login grants read:org,
+    # while registering an org runner needs admin:org.
+    if (-not (Test-Cmd gh)) {
+      Fail 'No -Pat, no -RegistrationToken, and gh is not on PATH. Install gh (this script does, unless -SkipToolchain), or pass a credential.'
+    }
+    Info 'Requesting a registration token via gh'
+    $apiPath = $api -replace '^https://api\.github\.com/', ''
+    # ErrorActionPreference is 'Stop' for this script, and under it PowerShell
+    # turns a native command's stderr into a thrown NativeCommandError -- which
+    # would bury the actionable guidance below under a parser trace. Relaxed
+    # just for this call so gh's own message can be captured as text.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # ToString() per record, not a bare Out-String: `2>&1` yields ErrorRecords,
+    # and formatting those renders PowerShell's own "At <script>:<line> char:"
+    # trace around gh's message -- noise in what is meant to be a readable
+    # instruction.
+    $ghOut = (& gh api -X POST $apiPath --jq '.token' 2>&1 |
+                ForEach-Object { $_.ToString() }) -join "`n"
+    $ghOut = $ghOut.Trim()
+    $ghCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    $token = $ghOut
+    if ($ghCode -ne 0 -or -not $token -or $token -match '\s') {
+      Fail @"
+gh could not mint a registration token from $apiPath.
+
+  $ghOut
+
+If that says the operation needs a scope, grant it once and re-run:
+
+    gh auth refresh -h github.com -s admin:org
+
+(admin:org is for an ORG runner. A repo-scoped runner -- pass
+-Url https://github.com/<owner>/<repo> -- needs admin on that repo instead,
+and some orgs disable repo-level runners entirely, which the API reports as a
+404 rather than a permission error.)
+"@
+    }
   }
 
   Push-Location $RunnerRoot
@@ -613,7 +685,7 @@ if ($SkipRegistration) {
 
 $hooks = Join-Path $RunnerRoot 'hooks'
 New-Item -ItemType Directory -Force -Path $hooks | Out-Null
-Write-HookFiles -Destination $hooks
+Write-HookFiles -Destination $hooks | Out-Null
 
 $machineEnv = @{
   # Same reasoning as entrypoint.sh: without a cap, cargo sizes its thread pool
