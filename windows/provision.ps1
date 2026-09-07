@@ -67,6 +67,11 @@
 param(
   [string] $Url            = 'https://github.com/jkuracing',
   [string] $Pat            = $env:GITHUB_PAT,
+  # A registration token minted elsewhere, as an alternative to -Pat. The Linux
+  # entrypoint accepts RUNNER_TOKEN for the same reason: it lets the PAT stay
+  # off this machine entirely -- mint the token where the PAT already lives and
+  # pass only the short-lived result. Expires in ~1 hour.
+  [string] $RegistrationToken = $env:RUNNER_TOKEN,
   [Parameter(Mandatory)]
   [string] $ServiceAccount,
   [string] $Name           = "win-$env:COMPUTERNAME",
@@ -80,6 +85,12 @@ param(
   [string] $RunnerVersion  = '',
   [int]    $BuildJobs      = 0,
   [switch] $SkipToolchain,
+  # Skip the registration step and stop after the toolchain. config.cmd prompts
+  # for the service account password on an interactive console, so a session
+  # without a real stdin (a remote `prlctl exec`, a scripted deploy) cannot
+  # answer it. This lets the long unattended half run there and the short
+  # interactive half be done by a person.
+  [switch] $SkipRegistration,
   # Print everything this run would derive, then exit without touching the
   # machine. Worth having before provisioning a box you care about, and it is
   # how the derivation below is tested without side effects.
@@ -247,8 +258,8 @@ if ($ServiceAccount -match '^(NT AUTHORITY\\)?(LocalSystem|SYSTEM)$') {
   Fail 'ServiceAccount must not be LocalSystem: tauri''s NSIS cache and node_modules ownership both break under it. Use a dedicated local account.'
 }
 
-if (-not $Pat) {
-  Fail 'No PAT. Pass -Pat or set GITHUB_PAT (classic PAT: admin:org for an org runner, repo for a repo runner).'
+if (-not $Pat -and -not $RegistrationToken -and -not $SkipRegistration) {
+  Fail 'No credential. Pass -Pat/GITHUB_PAT (classic PAT: admin:org for an org runner, repo for a repo runner), or -RegistrationToken/RUNNER_TOKEN if you minted one elsewhere, or -SkipRegistration to install only the toolchain.'
 }
 
 # Fail early and clearly rather than at config.cmd time, where the error is
@@ -271,6 +282,15 @@ if (-not $RunnerVersion) {
   } catch {
     Fail "Could not resolve the latest actions/runner release: $_. Pass -RunnerVersion to pin one."
   }
+}
+
+# ".\name" is what config.cmd wants but is NOT a resolvable NTAccount string,
+# so every ACL below needs the machine-qualified form or it throws
+# IdentityNotMappedException.
+$aclIdentity = if ($ServiceAccount -like '.\*') {
+  "$env:COMPUTERNAME\$($ServiceAccount -replace '^\.\\', '')"
+} else {
+  $ServiceAccount
 }
 
 $arch = $env:PROCESSOR_ARCHITECTURE
@@ -408,13 +428,38 @@ if (-not $SkipToolchain) {
   # Rust. Both MSVC targets are added regardless of host so either direction of
   # cross-compilation works; that is how an ARM64 box produces the shipping x64
   # installer.
-  if (-not (Test-Cmd rustup)) {
+  # Rust goes to a MACHINE-WIDE location, not %USERPROFILE%.
+  #
+  # This is the one toolchain here that defaults to a per-user path, and
+  # getting it wrong is invisible until the first job. Provisioning runs
+  # elevated -- often as SYSTEM -- while jobs run as the service account, so a
+  # default install puts cargo in the provisioning account's profile, publishes
+  # that unreadable path on the machine PATH, and the runner then registers
+  # cleanly and fails every job with "cargo not found". Setting CARGO_HOME and
+  # RUSTUP_HOME before rustup-init runs makes the install account-independent.
+  $rustRoot   = 'C:\rust'
+  $cargoHome  = Join-Path $rustRoot 'cargo'
+  $rustupHome = Join-Path $rustRoot 'rustup'
+  [Environment]::SetEnvironmentVariable('CARGO_HOME',  $cargoHome,  'Machine')
+  [Environment]::SetEnvironmentVariable('RUSTUP_HOME', $rustupHome, 'Machine')
+  $env:CARGO_HOME  = $cargoHome
+  $env:RUSTUP_HOME = $rustupHome
+
+  if (-not (Test-Path (Join-Path $cargoHome 'bin\rustup.exe'))) {
     $exe = Join-Path $tempDir 'rustup-init.exe'
     Get-File "https://static.rust-lang.org/rustup/dist/$(if($isArm){'aarch64'}else{'x86_64'})-pc-windows-msvc/rustup-init.exe" $exe
-    Info 'Installing Rust'
-    Start-Process $exe -ArgumentList '-y','--default-toolchain','stable','--profile','minimal' -Wait
+    Info "Installing Rust into $rustRoot"
+    Start-Process $exe -ArgumentList '-y','--default-toolchain','stable','--profile','minimal' -Wait -NoNewWindow
   }
-  Add-MachinePath "$env:USERPROFILE\.cargo\bin"
+  Add-MachinePath (Join-Path $cargoHome 'bin')
+
+  # cargo writes to CARGO_HOME (the registry cache, and `cargo install`), so
+  # the service account needs Modify here, not merely Read.
+  $rustAcl = Get-Acl $rustRoot
+  $rustAcl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+    $aclIdentity, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  Set-Acl -Path $rustRoot -AclObject $rustAcl
+  Info "Granted $aclIdentity Modify on $rustRoot"
   rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
   rustup component add rustfmt clippy
 
@@ -490,70 +535,71 @@ if (-not (Test-Path (Join-Path $RunnerRoot 'config.cmd'))) {
 # then fails on its first write to _work, which surfaces as an opaque job
 # failure rather than a permissions error.
 Info "Granting $ServiceAccount full control of $RunnerRoot"
-# ".\name" is what config.cmd wants but is NOT a resolvable NTAccount string,
-# so the ACL below needs the machine-qualified form or it throws
-# IdentityNotMappedException.
-$aclIdentity = if ($ServiceAccount -like '.\*') {
-  "$env:COMPUTERNAME\$($ServiceAccount -replace '^\.\\', '')"
-} else {
-  $ServiceAccount
-}
 $acl = Get-Acl $RunnerRoot
 $rule = New-Object Security.AccessControl.FileSystemAccessRule(
   $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
 $acl.SetAccessRule($rule)
 Set-Acl -Path $RunnerRoot -AclObject $acl
 
-Info 'Requesting a registration token'
-try {
-  $resp = Invoke-RestMethod -Method Post -Uri $api -Headers @{
-    Authorization = "Bearer $Pat"
-    Accept        = 'application/vnd.github+json'
-  }
-} catch {
-  Fail "Could not mint a registration token from $api -- check the PAT's scopes. $_"
-}
-$token = $resp.token
-
-Push-Location $RunnerRoot
-try {
-  # Remove any previous registration so re-running this script is an upgrade
-  # rather than an error. `.runner_migrated` MUST be in this list: the runner
-  # self-updates in place and drops that marker, and config.cmd treats the
-  # marker ALONE as proof it is already configured. Leaving it behind is what
-  # silently took the Linux fleet offline about ten days after a rebuild.
-  if (Get-Service 'actions.runner.*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "*$Name*" }) {
-    Info 'Removing the existing service registration'
-    try { & .\config.cmd remove --token $token } catch { Warn "config.cmd remove failed: $_" }
-  }
-  foreach ($stale in '.runner','.credentials','.credentials_rsaparams','.runner_migrated','.credentials_migrated') {
-    # Named explicitly rather than via Get-ChildItem -Include, which needs a
-    # wildcard path to match anything and would silently clean nothing here.
-    Remove-Item -Force -LiteralPath $stale -ErrorAction SilentlyContinue
+if ($SkipRegistration) {
+  Warn 'SkipRegistration: installing the toolchain only, leaving the runner unregistered.'
+} else {
+  if ($RegistrationToken) {
+    Info 'Using the registration token supplied on the command line'
+    $token = $RegistrationToken
+  } else {
+    Info 'Requesting a registration token'
+    try {
+      $resp = Invoke-RestMethod -Method Post -Uri $api -Headers @{
+        Authorization = "Bearer $Pat"
+        Accept        = 'application/vnd.github+json'
+      }
+    } catch {
+      Fail "Could not mint a registration token from $api -- check the PAT's scopes. $_"
+    }
+    $token = $resp.token
   }
 
-  Info 'Configuring the runner as a Windows service'
-  Warn 'config.cmd will now prompt for the service account password. It goes straight into the runner and is not stored, logged, or passed on a command line.'
+  Push-Location $RunnerRoot
+  try {
+    # Remove any previous registration so re-running this script is an upgrade
+    # rather than an error. `.runner_migrated` MUST be in this list: the runner
+    # self-updates in place and drops that marker, and config.cmd treats the
+    # marker ALONE as proof it is already configured. Leaving it behind is what
+    # silently took the Linux fleet offline about ten days after a rebuild.
+    if (Get-Service 'actions.runner.*' -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -like "*$Name*" }) {
+      Info 'Removing the existing service registration'
+      try { & .\config.cmd remove --token $token } catch { Warn "config.cmd remove failed: $_" }
+    }
+    foreach ($stale in '.runner','.credentials','.credentials_rsaparams','.runner_migrated','.credentials_migrated') {
+      # Named explicitly rather than via Get-ChildItem -Include, which needs a
+      # wildcard path to match anything and would silently clean nothing here.
+      Remove-Item -Force -LiteralPath $stale -ErrorAction SilentlyContinue
+    }
 
-  # NOTE: deliberately NOT --unattended. Everything else is supplied, so the
-  # only thing it can prompt for is the password -- which is exactly where we
-  # want it entered. Passing --windowslogonpassword instead would put the
-  # password in this process's command line, visible to any other process on
-  # the machine for the lifetime of the call.
-  & .\config.cmd `
-    --url $Url `
-    --token $token `
-    --name $Name `
-    --labels $Labels `
-    --work '_work' `
-    --replace `
-    --runasservice `
-    --windowslogonaccount $ServiceAccount
+    Info 'Configuring the runner as a Windows service'
+    Warn 'config.cmd will now prompt for the service account password. It goes straight into the runner and is not stored, logged, or passed on a command line.'
 
-  if ($LASTEXITCODE -ne 0) { Fail "config.cmd exited $LASTEXITCODE" }
-} finally {
-  Pop-Location
+    # NOTE: deliberately NOT --unattended. Everything else is supplied, so the
+    # only thing it can prompt for is the password -- which is exactly where we
+    # want it entered. Passing --windowslogonpassword instead would put the
+    # password in this process's command line, visible to any other process on
+    # the machine for the lifetime of the call.
+    & .\config.cmd `
+      --url $Url `
+      --token $token `
+      --name $Name `
+      --labels $Labels `
+      --work '_work' `
+      --replace `
+      --runasservice `
+      --windowslogonaccount $ServiceAccount
+
+    if ($LASTEXITCODE -ne 0) { Fail "config.cmd exited $LASTEXITCODE" }
+  } finally {
+    Pop-Location
+  }
 }
 
 # --------------------------------------------------------------------------
@@ -585,6 +631,17 @@ foreach ($k in $machineEnv.Keys) {
 }
 
 $svc = Get-Service | Where-Object { $_.Name -like 'actions.runner.*' } | Select-Object -First 1
+if ($SkipRegistration) {
+  Info ''
+  Info 'Toolchain installed. To finish, run this from an ELEVATED PowerShell'
+  Info 'on the machine itself -- config.cmd prompts for the account password on'
+  Info 'an interactive console, which a remote or scripted session cannot answer:'
+  Info ''
+  Info "    `$env:GITHUB_PAT = '<classic PAT>'"
+  Info "    $($MyInvocation.MyCommand.Path) -ServiceAccount '$ServiceAccount' -SkipToolchain"
+  Info ''
+  exit 0
+}
 if ($svc) {
   Info "Restarting $($svc.Name) so it picks up the machine environment"
   Restart-Service $svc.Name
