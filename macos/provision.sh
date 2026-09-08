@@ -35,6 +35,10 @@
 #   ./provision.sh --dry-run          # derive everything, touch nothing
 #   ./provision.sh --skip-toolchain   # re-register only
 #
+# Run it as yourself, NOT with sudo: the toolchain installs into $HOME, and the
+# single privileged step (installing the LaunchDaemon) calls sudo on its own.
+# You will be prompted for your password once, at that step.
+#
 set -euo pipefail
 
 # --------------------------------------------------------------------------
@@ -85,27 +89,18 @@ warn() { printf '\033[33m!!  %s\033[0m\n' "$*"; }
 fail() { printf '\033[31m!!  %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
-# Refuse to run as root
+# Refuse to run the WHOLE script as root
 #
-# The macOS twin of the Windows script's LocalSystem refusal, and it matters
-# more here, not less. `svc.sh install` under root writes a LaunchDaemon; every
-# job then runs outside a user session, and three things break:
+# Not about account isolation -- the runner deliberately runs as the invoking
+# user (see the LaunchDaemon section). It is about where the toolchain lands.
+# Homebrew and rustup install into $HOME, so `sudo ./provision.sh` would put
+# them in /var/root, leave root-owned files behind, and hand the runner a PATH
+# pointing at a toolchain its user cannot read.
 #
-#   - codesign has no login keychain to reach. Today's bundle is ad-hoc signed
-#     (publish-gui.yml asserts `Signature=adhoc`), so this does not bite yet --
-#     but it bites the moment a Developer ID identity is introduced, and it
-#     bites as an opaque "errSecInternalComponent".
-#   - xcodebuild and actool want a user context; failures there surface as
-#     missing-asset errors rather than as permission errors.
-#   - anything the build caches under ~/Library lands in root's home, so a
-#     later non-root run silently repeats the work -- and files left root-owned
-#     make the next run fail on permissions, the same way a SYSTEM-owned
-#     node_modules does on Windows.
-#
-# The runner therefore runs as YOU, as a LaunchAgent. See the login caveat in
-# the registration section.
+# The one step that genuinely needs privilege -- writing the LaunchDaemon into
+# /Library/LaunchDaemons -- calls sudo itself, and only there.
 # --------------------------------------------------------------------------
-[ "$(id -u)" -eq 0 ] && fail "do not run this as root (or with sudo). The runner must be a per-user LaunchAgent; see the comment above this check."
+[ "$(id -u)" -eq 0 ] && fail "run this as your normal user, not with sudo. Homebrew and rustup install into \$HOME; the one privileged step calls sudo itself."
 
 [ "$(uname -s)" = "Darwin" ] || fail "this is the macOS provisioner; use the Dockerfile on Linux or windows/provision.ps1 on Windows"
 
@@ -162,7 +157,7 @@ esac
 info "Architecture    : $ARCH (runner package: $RUNNER_ARCH)"
 info "Runner name     : $NAME"
 info "Labels          : $LABELS"
-info "Runs as         : $(id -un) (LaunchAgent)"
+info "Runs as         : $(id -un) (LaunchDaemon, starts at boot)"
 info "CARGO_BUILD_JOBS: $BUILD_JOBS"
 info "Registration    : $SCOPE — $API"
 info "Runner root     : $RUNNER_ROOT (actions-runner ${RUNNER_VERSION:-latest})"
@@ -315,10 +310,21 @@ if [ -z "$REG_TOKEN" ]; then
     || fail "could not mint a registration token — check the PAT's scope ($SCOPE)"
 fi
 
-# svc.sh refuses to reconfigure a running service, and config.sh refuses to
-# reconfigure an existing registration, so an upgrade run has to unwind both.
+# config.sh refuses to reconfigure an existing registration, and the daemon
+# holds the runner binary open, so an upgrade run has to unwind both. Any
+# actions.runner daemon here is ours, whatever it was labelled on a previous
+# run -- the name or the org could have changed since.
+for old_plist in /Library/LaunchDaemons/actions.runner.*.plist; do
+  [ -e "$old_plist" ] || continue
+  if grep -q "$RUNNER_ROOT" "$old_plist" 2>/dev/null; then
+    info "Stopping the existing daemon ($(basename "$old_plist"))"
+    sudo launchctl bootout system "$old_plist" 2>/dev/null || true
+    sudo rm -f "$old_plist"
+  fi
+done
+# A LaunchAgent from an earlier version of this script, or from `svc.sh`.
 if [ -f "$RUNNER_ROOT/svc.sh" ] && ./svc.sh status >/dev/null 2>&1; then
-  info "Stopping and uninstalling the existing service"
+  info "Removing the previous LaunchAgent"
   ./svc.sh stop || true
   ./svc.sh uninstall || true
 fi
@@ -336,23 +342,63 @@ info "Registering $NAME"
   --labels "$LABELS" \
   --work _work
 
-# `svc.sh install` with no argument installs a LaunchAgent for the current
-# user. That is the point -- see the root refusal above -- but it carries one
-# operational consequence worth stating plainly:
+# A LaunchDaemon, not the LaunchAgent `svc.sh install` would create.
 #
-#   A LaunchAgent starts at LOGIN, not at boot.
+# svc.sh writes ~/Library/LaunchAgents/..., and an agent starts at LOGIN. After
+# a reboot the runner would not come back until someone logged in, and jobs
+# would sit queued with no error anywhere -- indistinguishable from a stalled
+# fleet until you go looking. This machine is meant to be unattended, so the
+# plist is written here instead.
 #
-# After a reboot this runner does not come back until someone logs in. Jobs
-# then sit queued with no error anywhere, which is indistinguishable from a
-# stalled fleet until you go looking. If this Mac is meant to be unattended,
-# enable automatic login (System Settings > Users & Groups) and keep it awake
-# (`sudo pmset -a sleep 0 disablesleep 1`), or accept that a reboot needs a
-# human.
-info "Installing the LaunchAgent"
-./svc.sh install
-./svc.sh start
+# `UserName` is what makes a daemon usable rather than merely early: Homebrew
+# and rustup live in this user's home, so a root-owned daemon would run with a
+# PATH pointing at a toolchain in /var/root that does not exist. Running as the
+# invoking user keeps the toolchain, the cargo registry and the sccache config
+# exactly where the toolchain step put them.
+#
+# SessionCreate gives the job its own security session. Not needed for today's
+# ad-hoc signing (publish-gui.yml asserts `Signature=adhoc`), but it is what a
+# Developer ID identity in the login keychain would later need, and it costs
+# nothing now.
+DAEMON_LABEL="actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${NAME}"
+PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+
+info "Installing LaunchDaemon $PLIST (runs as $(id -un), starts at boot)"
+sudo tee "$PLIST" >/dev/null <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${RUNNER_ROOT}/runsvc.sh</string></array>
+  <key>WorkingDirectory</key><string>${RUNNER_ROOT}</string>
+  <key>UserName</key><string>$(id -un)</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>SessionCreate</key><true/>
+  <key>StandardOutPath</key><string>${RUNNER_ROOT}/_diag/daemon.out.log</string>
+  <key>StandardErrorPath</key><string>${RUNNER_ROOT}/_diag/daemon.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>${HOME}</string>
+    <key>PATH</key><string>${HOME}/.cargo/bin:$(dirname "${BREW:-/opt/homebrew/bin/brew}"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+PLISTEOF
+sudo chown root:wheel "$PLIST"
+sudo chmod 644 "$PLIST"
+mkdir -p "$RUNNER_ROOT/_diag"
+
+# bootout first so a re-run replaces cleanly; it fails when nothing is loaded,
+# which is fine and is why the failure is swallowed.
+sudo launchctl bootout system "$PLIST" 2>/dev/null || true
+sudo launchctl bootstrap system "$PLIST"
+sudo launchctl enable "system/${DAEMON_LABEL}"
 sleep 2
-./svc.sh status || true
+sudo launchctl print "system/${DAEMON_LABEL}" 2>/dev/null | sed -n '1,6p' || \
+  warn "launchctl print failed; check $RUNNER_ROOT/_diag/daemon.err.log"
 
 info ""
 info "Done. The runner should now appear under the org's Actions > Runners"

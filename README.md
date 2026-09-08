@@ -167,31 +167,34 @@ export GITHUB_PAT=<classic PAT with admin:org>
 ./macos/provision.sh              # for real
 ```
 
-### It runs as you, not as root
+### A LaunchDaemon, running as you
 
-The script refuses to run under `sudo`. `svc.sh install` as root installs a
-**LaunchDaemon**, and every job then runs outside a user session:
+`svc.sh install` would write a **LaunchAgent**, and an agent starts at *login*.
+After a reboot the runner would not come back until someone logged in, and jobs
+would queue with no error anywhere — indistinguishable from a stalled fleet
+until you go looking. So the provisioner writes the plist itself, into
+`/Library/LaunchDaemons`, with `RunAtLoad`: it comes up at boot, unattended.
 
-- `codesign` has no login keychain to reach. Today's bundle is ad-hoc signed
-  (publish-gui.yml asserts `Signature=adhoc`), so this does not bite yet — but
-  it bites the moment a Developer ID identity appears, as an opaque
-  `errSecInternalComponent`.
-- `xcodebuild` and `actool` want a user context; failures surface as
-  missing-asset errors rather than permission errors.
-- Build caches under `~/Library` land in root's home, and root-owned files make
-  the next non-root run fail — the same shape as the SYSTEM-owned
-  `node_modules` trap on Windows.
+`UserName` is what makes a daemon usable rather than merely early. Homebrew and
+rustup live in your home, so a root-owned daemon would run with a `PATH`
+pointing at a toolchain in `/var/root` that does not exist. Running as the
+invoking user keeps the toolchain, the cargo registry and the sccache config
+exactly where the toolchain step put them. There is no separate service
+account: it is not needed here, and one more account is one more thing to own.
 
-### A LaunchAgent starts at login, not at boot
+`SessionCreate` gives each job its own security session. Not needed for today's
+ad-hoc signing (`publish-gui.yml` asserts `Signature=adhoc`), but it is what a
+Developer ID identity in the login keychain would later want, and it costs
+nothing now.
 
-This is the one thing that will catch you out. After a reboot the runner does
-not come back until someone logs in, and jobs then sit **queued with no error
-anywhere** — indistinguishable from a stalled fleet until you go looking. For
-an unattended Mac, enable automatic login and keep it awake:
+**Run the script as yourself, not with `sudo`.** Homebrew and rustup install
+into `$HOME`, so a fully-elevated run would put them in `/var/root` and leave
+root-owned files behind. The single privileged step — installing the daemon —
+calls `sudo` on its own, and prompts you once.
 
-```bash
-sudo pmset -a sleep 0 disablesleep 1
-```
+Re-running replaces the daemon cleanly: any `actions.runner.*` plist pointing
+at this runner root is booted out and removed first, including a LaunchAgent
+left by an earlier version of this script.
 
 ### Xcode is checked, not installed
 
