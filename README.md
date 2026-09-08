@@ -134,6 +134,32 @@ docker compose up -d --build
 > is missing, so it will happily keep running a stale image after the Dockerfile
 > or `entrypoint.sh` changes.
 
+## x86_64 runners on an Apple Silicon host
+
+`runner-amd64-1` and `runner-amd64-2` are `linux/amd64` containers on the same
+aarch64 host. OrbStack runs them through **Rosetta**, not qemu, so this is
+translation at roughly native speed rather than emulation at a fraction of it.
+
+They carry their own labels — `hbf-builder-amd64,fw-builder-amd64` — rather
+than the shared `fw-builder,hbf-builder` pair. A runner is offered a job when
+its labels are a *superset* of the job's `runs-on`, so adding `hbf-builder`
+here would let ordinary aarch64 work land on a translated container and run
+slower for nothing.
+
+**Why not cross-compile from aarch64 instead.** hbf's binaries pull in
+`tokio-serial` → `serialport`, which links `libudev` on Linux. `cargo-zigbuild`
+supplies a cross C toolchain but not an x86_64 `libudev` sysroot, so a cross
+build needs a hand-maintained multiarch sysroot. An amd64 runner needs neither:
+the image installs `libudev-dev` for whatever architecture it is built for.
+
+Two replicas rather than twelve — x86_64 artifacts are published from pushes to
+`main`, not from every PR, so this is a low-duty-cycle lane sized not to
+compete with the aarch64 fleet for the host.
+
+```bash
+docker compose up -d --build runner-amd64-1 runner-amd64-2
+```
+
 ## Windows runners
 
 Linux runs in Docker; Windows does not. Windows containers cannot run on the

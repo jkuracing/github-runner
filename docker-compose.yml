@@ -50,7 +50,11 @@ x-runner: &runner
   # than slow CI. entrypoint.sh probes the bucket itself and degrades to
   # wrapper-less builds if it cannot be reached.
   depends_on: [sccache-s3]
-  environment:
+  # Anchored separately so a service can override ONE variable (the amd64 lane
+  # overrides RUNNER_LABELS) without restating the whole block: merging
+  # `<<: *runner` and then giving `environment:` would replace the mapping
+  # wholesale, silently dropping URL, GITHUB_PAT and the cargo knobs.
+  environment: &runner-env
     URL: ${URL}
     GITHUB_PAT: ${GITHUB_PAT}
     # Defaulted to empty: entrypoint.sh prefers GITHUB_PAT and only falls back
@@ -242,6 +246,44 @@ services:
     <<: *runner
     volumes: [cargo-registry-12:/home/runner/.cargo/registry]
 
+  # x86_64 runners, on the same Apple Silicon host.
+  #
+  # OrbStack runs linux/amd64 containers through Rosetta rather than qemu, so
+  # this is translation at roughly native speed rather than emulation at a
+  # tenth of it -- verified on this host: `docker run --platform linux/amd64
+  # alpine uname -m` reports x86_64.
+  #
+  # Why a native-ish amd64 runner instead of cross-compiling from aarch64:
+  # hbf's binaries pull in tokio-serial -> serialport, which links libudev on
+  # Linux. cargo-zigbuild supplies a cross C toolchain but NOT an x86_64
+  # libudev sysroot, so a cross build needs a multiarch sysroot maintained by
+  # hand. Building on an amd64 runner needs neither -- the image already
+  # installs libudev-dev for whatever architecture it is built for.
+  #
+  # A DISTINCT label, not the shared pair: a runner is offered a job when its
+  # labels are a superset of the job's `runs-on`, so giving these
+  # `hbf-builder` would let ordinary aarch64 work land on a translated x86_64
+  # container and run slower for no reason. Only jobs that explicitly want
+  # x86_64 should come here.
+  #
+  # Two replicas, not twelve. x86_64 artifacts are published from pushes to
+  # main rather than from every PR, so this is a low-duty-cycle lane; it is
+  # sized to not compete with the aarch64 fleet for the host.
+  runner-amd64-1:
+    <<: *runner
+    platform: linux/amd64
+    environment:
+      <<: *runner-env
+      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}
+    volumes: [cargo-registry-amd64-1:/home/runner/.cargo/registry]
+  runner-amd64-2:
+    <<: *runner
+    platform: linux/amd64
+    environment:
+      <<: *runner-env
+      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}
+    volumes: [cargo-registry-amd64-2:/home/runner/.cargo/registry]
+
 volumes:
   # The single shared compilation cache, bounded by the ilm rule and quota that
   # sccache-s3-init applies. Replaces the twelve per-replica sccache volumes.
@@ -258,3 +300,5 @@ volumes:
   cargo-registry-10:
   cargo-registry-11:
   cargo-registry-12:
+  cargo-registry-amd64-1:
+  cargo-registry-amd64-2:
