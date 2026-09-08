@@ -134,6 +134,99 @@ docker compose up -d --build
 > is missing, so it will happily keep running a stale image after the Dockerfile
 > or `entrypoint.sh` changes.
 
+## macOS runners
+
+Linux runs in Docker; macOS cannot. It is not virtualisable into the fleet, and
+Apple's licence ties macOS VMs to Apple hardware, so a macOS runner is
+provisioned natively onto a Mac that is set up once and kept.
+`macos/provision.sh` is that provisioning, idempotent in the same way
+`windows/provision.ps1` is: re-running upgrades the toolchain and re-registers
+against a freshly minted token.
+
+### Why you would want one
+
+The org has no GitHub Actions budget, so hosted jobs fail before they start:
+
+```
+The job was not started because recent account payments have failed
+or your spending limit needs to be increased.
+```
+
+Linux work moved onto the fleet. macOS work had nowhere to go. Without a
+self-hosted Mac these stay stranded:
+
+| workflow | job |
+|---|---|
+| `hbf` publish-gui.yml | the `Hbf.app` bundle (`runs-on: xcode-27`) |
+| `hbf` publish-binaries.yml | `macos-aarch64`, `macos-x86_64` |
+
+```bash
+export GITHUB_PAT=<classic PAT with admin:org>
+
+./macos/provision.sh --dry-run    # derive everything, touch nothing
+./macos/provision.sh              # for real
+```
+
+### A LaunchDaemon, running as you
+
+`svc.sh install` would write a **LaunchAgent**, and an agent starts at *login*.
+After a reboot the runner would not come back until someone logged in, and jobs
+would queue with no error anywhere — indistinguishable from a stalled fleet
+until you go looking. So the provisioner writes the plist itself, into
+`/Library/LaunchDaemons`, with `RunAtLoad`: it comes up at boot, unattended.
+
+`UserName` is what makes a daemon usable rather than merely early. Homebrew and
+rustup live in your home, so a root-owned daemon would run with a `PATH`
+pointing at a toolchain in `/var/root` that does not exist. Running as the
+invoking user keeps the toolchain, the cargo registry and the sccache config
+exactly where the toolchain step put them. There is no separate service
+account: it is not needed here, and one more account is one more thing to own.
+
+`SessionCreate` gives each job its own security session. Not needed for today's
+ad-hoc signing (`publish-gui.yml` asserts `Signature=adhoc`), but it is what a
+Developer ID identity in the login keychain would later want, and it costs
+nothing now.
+
+**Run the script as yourself, not with `sudo`.** Homebrew and rustup install
+into `$HOME`, so a fully-elevated run would put them in `/var/root` and leave
+root-owned files behind. The single privileged step — installing the daemon —
+calls `sudo` on its own, and prompts you once.
+
+Re-running replaces the daemon cleanly: any `actions.runner.*` plist pointing
+at this runner root is booted out and removed first, including a LaunchAgent
+left by an earlier version of this script.
+
+### Xcode is checked, not installed
+
+Xcode is a ~20 GB Apple-account-gated download, and which version a build
+machine carries is a decision rather than a detail. The script verifies it and
+explains what is wrong instead.
+
+**Version matters.** hbf's `publish-gui.yml` targets the `xcode-27` label
+because Icon Composer saved `hbf-gui/icons/icon.icon` with 27-era features that
+Xcode 26.6's `actool` cannot open. The provisioner derives an `xcode-<major>`
+label from the installed Xcode, so a Mac with 27 picks up that workflow with no
+edit to it — and warns if Xcode is older, since the label would then route work
+to a machine that cannot do it.
+
+### Labels
+
+Default: `macos,macos-<arch>,hbf-builder,xcode-<major>`.
+
+Labels name what the machine **is**, not what it builds — the same rule as the
+Windows runner. An arm64 Mac cross-compiles `x86_64-apple-darwin` perfectly
+well, so `macos-x64` would be a lie that breaks the day an Intel Mac appears.
+
+### Sharing a host
+
+`CARGO_BUILD_JOBS` defaults to half the cores. On the machine this was written
+for, the Mac also hosts the OrbStack Linux fleet and a Parallels VM, and an
+unthrottled native build starves the replicas until their runners drop with
+"lost communication".
+
+The disk sweep is the fleet's `job-completed-hook.sh`, reused rather than
+duplicated, at `SWEEP_MAX_GB=8`.
+
 ## Windows runners
 
 Linux runs in Docker; Windows does not. Windows containers cannot run on the
