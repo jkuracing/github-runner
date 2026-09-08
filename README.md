@@ -348,6 +348,18 @@ has no equivalent hook and the runner's `.env` is read only by the Linux
 systemd unit, so `provision.ps1` sets them as **machine-level** environment and
 restarts the service to pick them up.
 
+`SWEEP_ROOTS` is a `;`-separated list and `SWEEP_MAX_GB` applies to **each root
+independently**, so the ceiling is roots x budget. Provisioning adds the
+machine's manual source tree (`C:\h`) alongside the runner's `_work` when it
+exists: it carries full release builds for every architecture the box targets
+and is not covered by CI's own budget, so it otherwise grows without bound.
+
+The sweep refuses to run at all while `cargo`, `rustc` or `cargo-nextest` is
+running anywhere on the machine. Between CI jobs that is a no-op -- nothing
+should be compiling -- but roots outside `_work` have no such guarantee: a
+person can be mid-build in one when an unrelated CI job finishes, and nothing
+coordinates the two.
+
 `CARGO_BUILD_JOBS` defaults to half the CPUs rather than all of them. This VM
 is expected to share a host with other work, and an unthrottled Windows build
 starves the OrbStack Linux fleet badly enough that its runners drop with "lost

@@ -158,22 +158,29 @@ $JobCompletedHook = @'
 <#
   Runs after EVERY job, via ACTIONS_RUNNER_HOOK_JOB_COMPLETED.
 
-  The PowerShell twin of job-completed-hook.sh: bound `target/` between jobs so
-  a persistent machine does not drift until the disk fills. On the Linux fleet
-  that surfaced not as "out of disk" but as a linker bus error, which cost real
-  time to diagnose; a Windows machine will fail differently but no more
+  The PowerShell twin of job-completed-hook.sh: bound build output between jobs
+  so a persistent machine does not drift until the disk fills. On the Linux
+  fleet that surfaced not as "out of disk" but as a linker bus error, which cost
+  real time to diagnose; a Windows machine will fail differently but no more
   clearly.
 
-  The budget is higher here than the fleet's 4 GB because this is ONE machine
-  rather than twelve replicas sharing a volume, and because a Windows build
-  tree carries both the host and the cross target -- hbf builds
-  aarch64-pc-windows-msvc and x86_64-pc-windows-msvc from one checkout.
+  SWEEP_ROOTS is a ";"-separated list, and SWEEP_MAX_GB applies to EACH root
+  independently rather than to their total -- so the ceiling is
+  roots x budget, which is the number to reason about when sizing a disk.
 
-  Why a job hook rather than a scheduled task: the runner invokes this between
-  jobs, so it can never delete a target/ out from under a live compile.
+  Two kinds of root, and the difference matters:
 
-  This bounds STEADY STATE, not the peak. A build in flight can exceed the
-  threshold and is only swept once it finishes.
+    <RunnerRoot>\_work   CI's own checkouts. Only this runner writes here, and
+                         the hook runs between jobs, so it can never delete a
+                         target/ out from under a live CI compile.
+    any other root       e.g. a manual source tree kept on the machine. Nobody
+                         coordinates with the runner there: somebody can be
+                         mid-`cargo build` in it when an unrelated CI job
+                         finishes. That is why this refuses to sweep at all
+                         while cargo or rustc is running anywhere on the box.
+
+  The budget bounds STEADY STATE, not the peak: a build in flight can exceed
+  the threshold and is only swept once it finishes.
 #>
 $ErrorActionPreference = 'Continue'
 
@@ -181,12 +188,16 @@ $ErrorActionPreference = 'Continue'
 # with Windows PowerShell 5.1, which has no null-coalescing operator and would
 # fail to parse the file outright.
 $maxGb = if ($env:SWEEP_MAX_GB) { [int]$env:SWEEP_MAX_GB } else { 8 }
-# The runner root's _work, NOT RUNNER_WORKSPACE. RUNNER_WORKSPACE is
-# per-repository, so using it would enforce the budget once per repo rather
-# than once per machine -- on the Linux fleet that let each replica hold twice
-# its nominal budget with two repos checked out.
-$workDir = if ($env:SWEEP_WORK_DIR) { $env:SWEEP_WORK_DIR } else { 'C:\actions-runner\_work' }
-if (-not (Test-Path $workDir)) { exit 0 }
+$roots = if ($env:SWEEP_ROOTS) { $env:SWEEP_ROOTS -split ';' } else { @('C:\actions-runner\_work') }
+
+# A cheap, decisive guard against deleting a target/ that something is actively
+# writing. Between CI jobs nothing should be compiling, so this is normally a
+# no-op; it earns its place for the roots CI does not own.
+$busy = @(Get-Process -Name cargo, rustc, cargo-nextest -ErrorAction SilentlyContinue)
+if ($busy.Count -gt 0) {
+  Write-Host "sweep: skipped -- $($busy.Count) cargo/rustc process(es) running, a sweep now could race a live build"
+  exit 0
+}
 
 function Get-SizeMb($Path) {
   try {
@@ -195,34 +206,39 @@ function Get-SizeMb($Path) {
   } catch { 0 }
 }
 
-$usedMb  = Get-SizeMb $workDir
-$limitMb = $maxGb * 1024
-if ($usedMb -le $limitMb) {
-  Write-Host "sweep: _work at $usedMb MB, under the $limitMb MB budget -- keeping it warm"
-  exit 0
-}
+foreach ($root in $roots) {
+  $root = $root.Trim()
+  if (-not $root -or -not (Test-Path $root)) { continue }
 
-Write-Host "sweep: _work at $usedMb MB exceeds $limitMb MB -- removing target dirs"
+  $usedMb  = Get-SizeMb $root
+  $limitMb = $maxGb * 1024
+  if ($usedMb -le $limitMb) {
+    Write-Host "sweep: $root at $usedMb MB, under the $limitMb MB budget -- keeping it warm"
+    continue
+  }
 
-# Largest first, stopping as soon as the budget is met, so the machine keeps as
-# much warmth as the budget allows instead of being emptied wholesale. Only
-# genuine cargo target dirs are touched: the CACHEDIR.TAG / debug / release
-# test avoids deleting a source directory that merely happens to be named
-# "target".
-$targets = Get-ChildItem -LiteralPath $workDir -Recurse -Directory -Force -Filter 'target' -ErrorAction SilentlyContinue |
-  Where-Object {
-    (Test-Path (Join-Path $_.FullName 'CACHEDIR.TAG')) -or
-    (Test-Path (Join-Path $_.FullName 'debug'))        -or
-    (Test-Path (Join-Path $_.FullName 'release'))
-  } |
-  ForEach-Object { [pscustomobject]@{ Path = $_.FullName; Mb = Get-SizeMb $_.FullName } } |
-  Sort-Object Mb -Descending
+  Write-Host "sweep: $root at $usedMb MB exceeds $limitMb MB -- removing target dirs"
 
-foreach ($t in $targets) {
-  if ($usedMb -le $limitMb) { break }
-  Remove-Item -LiteralPath $t.Path -Recurse -Force -ErrorAction SilentlyContinue
-  $usedMb -= $t.Mb
-  Write-Host "sweep: removed $($t.Path) ($($t.Mb) MB), now ~$usedMb MB"
+  # Largest first, stopping as soon as the budget is met, so the machine keeps
+  # as much warmth as the budget allows instead of being emptied wholesale.
+  # Only genuine cargo target dirs are touched: the CACHEDIR.TAG / debug /
+  # release test avoids deleting a source directory that merely happens to be
+  # named "target".
+  $targets = Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -Filter 'target' -ErrorAction SilentlyContinue |
+    Where-Object {
+      (Test-Path (Join-Path $_.FullName 'CACHEDIR.TAG')) -or
+      (Test-Path (Join-Path $_.FullName 'debug'))        -or
+      (Test-Path (Join-Path $_.FullName 'release'))
+    } |
+    ForEach-Object { [pscustomobject]@{ Path = $_.FullName; Mb = Get-SizeMb $_.FullName } } |
+    Sort-Object Mb -Descending
+
+  foreach ($t in $targets) {
+    if ($usedMb -le $limitMb) { break }
+    Remove-Item -LiteralPath $t.Path -Recurse -Force -ErrorAction SilentlyContinue
+    $usedMb -= $t.Mb
+    Write-Host "sweep: removed $($t.Path) ($($t.Mb) MB), now ~$usedMb MB"
+  }
 }
 
 # Never fail the job: this runs after the work that matters is already done and
@@ -910,6 +926,10 @@ $machineEnv = @{
   'ACTIONS_RUNNER_HOOK_JOB_STARTED'   = (Join-Path $hooks 'job-started-hook.sh')
   'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' = (Join-Path $hooks 'job-completed-hook.sh')
   'SWEEP_MAX_GB'             = '8'
+  # Per root, not in total. C:\h is this machine's manual source tree -- it
+  # carries full release builds for both architectures and is not covered by
+  # the runner's own _work budget, so it would otherwise grow without bound.
+  'SWEEP_ROOTS'              = (@((Join-Path $RunnerRoot '_work')) + @('C:\h' | Where-Object { Test-Path $_ })) -join ';'
 }
 foreach ($k in $machineEnv.Keys) {
   [Environment]::SetEnvironmentVariable($k, $machineEnv[$k], 'Machine')
