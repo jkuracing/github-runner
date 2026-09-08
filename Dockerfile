@@ -49,11 +49,27 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 # ============================================================================
 # Install ESP-IDF Xtensa toolchain for ESP32-S3
 # ============================================================================
-RUN mkdir -p /opt/esp-tools && \
-    # Install espup to manage ESP toolchains
-    cargo install espup --locked && \
-    # Install ESP Rust toolchain with ESP32-S3 support
-    espup install --targets esp32s3
+# Skippable, because not every runner needs it. The x86_64 lane exists to build
+# hbf's Linux binaries; firmware's Xtensa work runs on the aarch64 fleet, so
+# installing the ESP toolchain there is dead weight -- and it is by some margin
+# the slowest and most fragile step in this file:
+#
+#   espup resolves the Xtensa Rust release through the GitHub API UNAUTHENTICATED,
+#   so a rebuild that lands on a rate-limited IP fails with
+#     [warn]: Failed to get latest Xtensa Rust version: ... 403 Forbidden
+#   That is not architecture-specific -- any rebuild can hit it. espup honours
+#   GITHUB_TOKEN if you need to get past it.
+#
+# A runner built with INSTALL_ESP=0 MUST NOT carry a fw-builder* label: it
+# cannot build firmware.
+ARG INSTALL_ESP=1
+RUN if [ "$INSTALL_ESP" = "1" ]; then \
+      mkdir -p /opt/esp-tools && \
+      cargo install espup --locked && \
+      espup install --targets esp32s3; \
+    else \
+      echo "INSTALL_ESP=0: skipping the ESP/Xtensa toolchain"; \
+    fi
 
 # Add ESP toolchain binaries to PATH dynamically
 # espup creates export-esp.sh with the correct paths

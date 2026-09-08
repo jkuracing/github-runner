@@ -272,28 +272,38 @@ services:
   runner-amd64-1:
     <<: *runner
     platform: linux/amd64
-    # Opt-in. Without a profile these would start on a bare
-    # `docker compose up -d --build` -- the command this README documents --
-    # and quietly put two translated x86_64 containers on a host sized for
-    # twelve native ones. Start them with:
-    #   docker compose --profile amd64 up -d --build
-    profiles: [amd64]
+    # No ESP toolchain here: this lane builds hbf's x86_64 Linux binaries, and
+    # firmware's Xtensa work runs natively on the aarch64 fleet. Skipping it
+    # drops the slowest step in the image and the only one that reaches the
+    # GitHub API unauthenticated (and so rate-limits) at build time.
+    build:
+      context: .
+      args:
+        INSTALL_ESP: "0"
     environment:
       <<: *runner-env
-      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}
+      # hbf-builder-amd64 ONLY. Without the ESP toolchain this container cannot
+      # build firmware, so advertising fw-builder-amd64 would hand it jobs it is
+      # guaranteed to fail.
+      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64}
     volumes: [cargo-registry-amd64-1:/home/runner/.cargo/registry]
   runner-amd64-2:
     <<: *runner
     platform: linux/amd64
-    # Opt-in. Without a profile these would start on a bare
-    # `docker compose up -d --build` -- the command this README documents --
-    # and quietly put two translated x86_64 containers on a host sized for
-    # twelve native ones. Start them with:
-    #   docker compose --profile amd64 up -d --build
-    profiles: [amd64]
+    # No ESP toolchain here: this lane builds hbf's x86_64 Linux binaries, and
+    # firmware's Xtensa work runs natively on the aarch64 fleet. Skipping it
+    # drops the slowest step in the image and the only one that reaches the
+    # GitHub API unauthenticated (and so rate-limits) at build time.
+    build:
+      context: .
+      args:
+        INSTALL_ESP: "0"
     environment:
       <<: *runner-env
-      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}
+      # hbf-builder-amd64 ONLY. Without the ESP toolchain this container cannot
+      # build firmware, so advertising fw-builder-amd64 would hand it jobs it is
+      # guaranteed to fail.
+      RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64}
     volumes: [cargo-registry-amd64-2:/home/runner/.cargo/registry]
 
 volumes:
