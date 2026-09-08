@@ -272,6 +272,12 @@ services:
   runner-amd64-1:
     <<: *runner
     platform: linux/amd64
+    # Opt-in. Without a profile these would start on a bare
+    # `docker compose up -d --build` -- the command this README documents --
+    # and quietly put two translated x86_64 containers on a host sized for
+    # twelve native ones. Start them with:
+    #   docker compose --profile amd64 up -d --build
+    profiles: [amd64]
     environment:
       <<: *runner-env
       RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}
@@ -279,6 +285,12 @@ services:
   runner-amd64-2:
     <<: *runner
     platform: linux/amd64
+    # Opt-in. Without a profile these would start on a bare
+    # `docker compose up -d --build` -- the command this README documents --
+    # and quietly put two translated x86_64 containers on a host sized for
+    # twelve native ones. Start them with:
+    #   docker compose --profile amd64 up -d --build
+    profiles: [amd64]
     environment:
       <<: *runner-env
       RUNNER_LABELS: ${RUNNER_LABELS_AMD64:-hbf-builder-amd64,fw-builder-amd64}

@@ -156,9 +156,26 @@ Two replicas rather than twelve — x86_64 artifacts are published from pushes t
 `main`, not from every PR, so this is a low-duty-cycle lane sized not to
 compete with the aarch64 fleet for the host.
 
+They sit behind a compose **profile**, so a bare `docker compose up -d --build`
+starts the twelve aarch64 runners and nothing else — the x86_64 lane is opt-in:
+
 ```bash
-docker compose up -d --build runner-amd64-1 runner-amd64-2
+docker compose --profile amd64 up -d --build
 ```
+
+### Can x86_64 work leak onto this lane?
+
+Only if a workflow asks for it. Label matching is an exact-string superset
+test, not a prefix match, so `hbf-builder-amd64` does **not** satisfy a job
+requesting `hbf-builder`. Every self-hosted job in the org names an exact
+label today (`[fw-builder]`, `[hbf-builder]`, `[windows-arm64]`), so nothing
+can drift here by accident.
+
+The one way it could: GitHub adds implicit `self-hosted`, `Linux` and `X64` /
+`ARM64` labels to every runner, so a future job written as
+`runs-on: self-hosted` or `runs-on: [self-hosted, Linux]` would match these
+containers as readily as the native ones. Name the builder label explicitly and
+that cannot happen.
 
 ## Windows runners
 
