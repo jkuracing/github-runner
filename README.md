@@ -602,6 +602,20 @@ restarts the service to pick them up. Values that must differ between instances
 on one machine cannot live there — see "Several runners on one machine" below
 for where those go instead.
 
+The completed-job hook sweeps the instance's own `_work` (`SWEEP_WORK_DIR`)
+plus every root in `SWEEP_ROOTS`, a `;`-separated list, and `SWEEP_MAX_GB`
+applies to **each root independently**, so the ceiling is roots x budget.
+Provisioning puts the machine's manual source tree (`C:\h`) in `SWEEP_ROOTS`
+when it exists: it carries full release builds for every architecture the box
+targets and is not covered by CI's own budget, so it otherwise grows without
+bound.
+
+The sweep skips the `SWEEP_ROOTS` entries while `cargo`, `rustc` or
+`cargo-nextest` is running anywhere on the machine: a person can be mid-build
+in one when an unrelated CI job finishes, and nothing coordinates the two. The
+instance's own `_work` is swept regardless, because on a machine with several
+instances another one is usually compiling.
+
 `CARGO_BUILD_JOBS` defaults to half the CPUs rather than all of them, divided
 by the instance count. This VM is expected to share a host with other work, and
 an unthrottled Windows build starves the OrbStack Linux fleet badly enough that
