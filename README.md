@@ -237,11 +237,26 @@ self-hosted Mac these stay stranded:
 | `hbf` publish-binaries.yml | `macos-aarch64`, `macos-x86_64` |
 
 ```bash
-export GITHUB_PAT=<classic PAT with admin:org>
-
 ./macos/provision.sh --dry-run    # derive everything, touch nothing
 ./macos/provision.sh              # for real
 ```
+
+Nothing needs preparing: with no credential in the environment the script asks
+`gh` to mint the registration token, logging in and widening its own scope if it
+has to (an org runner needs `admin:org`, where gh's ordinary login carries
+`read:org`). `GITHUB_PAT` and `RUNNER_TOKEN` still work and take precedence, in
+that order — `RUNNER_TOKEN` is the one that keeps a PAT off this machine
+entirely.
+
+### Labels: only what the machine can serve
+
+The derived set is `macos,macos-arm64,xcode-<major>`. It deliberately does
+**not** include `hbf-builder`, even though a Mac is perfectly capable hardware.
+Fifteen hbf jobs ask for that label and every one is written for the Linux
+fleet — apt deps, the WebKitGTK/Tauri stack, AppImage packaging, the `xdg-open`
+shim, libudev. Since a runner takes any job whose `runs-on` its labels cover,
+carrying `hbf-builder` would make all fifteen eligible to land here and fail,
+*non-deterministically*, depending on which runner was free.
 
 ### A LaunchDaemon, running as you
 
