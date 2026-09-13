@@ -125,8 +125,21 @@ esac
 # open. Carrying the label here lets that workflow move off the hosted image
 # with no edit at all. Drop it from --labels if this Mac is ever downgraded
 # below Xcode 27, or that workflow will be routed here and fail on the icon.
+#
+# `hbf-builder` is deliberately NOT here. Fifteen hbf jobs ask for it -- Format,
+# Lint Rust, Test Rust, Test Rust (client), Test Rust (gui), the drift check, UI
+# lint, Build Python and more -- and every one of them is written for the Linux
+# fleet: apt-installed deps, the WebKitGTK/Tauri stack, AppImage packaging, the
+# xdg-open shim, libudev. A runner is offered a job when its labels are a
+# superset of the job's `runs-on`, so carrying that label would make all of them
+# eligible to land on macOS and fail. Worse, it would fail NON-DETERMINISTICALLY
+# -- the same commit passing or failing depending on which runner happened to be
+# free, which is the hardest kind of CI fault to trust a bisect through.
+#
+# Advertise only what this machine can actually serve. macOS work is addressed
+# by `macos` / `macos-arm64` / `xcode-<major>`.
 if [ -z "$LABELS" ]; then
-  LABELS="macos,macos-${ARCH},hbf-builder"
+  LABELS="macos,macos-${ARCH}"
   if [ -n "${XCODE_MAJOR:-}" ] || xcodebuild -version >/dev/null 2>&1; then
     XCODE_MAJOR="${XCODE_MAJOR:-$(xcodebuild -version 2>/dev/null | awk 'NR==1{split($2,v,"."); print v[1]}')}"
     [ -n "$XCODE_MAJOR" ] && LABELS="${LABELS},xcode-${XCODE_MAJOR}"
@@ -299,8 +312,47 @@ fi
 # Registration
 # --------------------------------------------------------------------------
 
+# Three ways to get a registration token, tried in order, matching
+# windows/provision.ps1:
+#
+#   RUNNER_TOKEN  one minted elsewhere -- keeps a PAT off this machine entirely
+#   GITHUB_PAT    a classic PAT
+#   gh            nothing to pass at all
+#
+# The gh path is the one worth reaching for. Its credential is managed and
+# revocable rather than a classic PAT pasted through a shell or parked in a
+# .env, and there is nothing to create beforehand. It needs one grant, because
+# gh's ordinary login carries read:org while registering an ORG runner needs
+# admin:org -- so rather than telling you that, this asks gh to widen its own
+# scope when a mint is refused.
+if [ -z "$REG_TOKEN" ] && [ -z "$PAT" ] && command -v gh >/dev/null 2>&1; then
+  gh_scope=admin:org
+  [ "$SCOPE" = repo ] && gh_scope=repo
+
+  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    info "gh is not logged in; starting gh auth login"
+    gh auth login --hostname github.com --scopes "$gh_scope" \
+      || fail "gh auth login failed. Pass --pat, or set RUNNER_TOKEN."
+  fi
+
+  info "Minting a registration token via gh"
+  REG_TOKEN="$(gh api -X POST "$API" --jq .token 2>/dev/null || true)"
+
+  if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = null ]; then
+    # Logged in but refused: overwhelmingly the scope. Ask for it rather than
+    # printing an instruction and exiting.
+    info "gh could not mint a token; requesting the '$gh_scope' scope"
+    gh auth refresh --hostname github.com --scopes "$gh_scope" \
+      || fail "gh auth refresh failed. Pass --pat, or set RUNNER_TOKEN."
+    REG_TOKEN="$(gh api -X POST "$API" --jq .token 2>/dev/null || true)"
+  fi
+
+  [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != null ] \
+    || fail "gh still could not mint a registration token for $API (scope: $gh_scope)"
+fi
+
 if [ -z "$REG_TOKEN" ]; then
-  [ -n "$PAT" ] || fail "need GITHUB_PAT (classic, admin:org for an org runner) or RUNNER_TOKEN"
+  [ -n "$PAT" ] || fail "no credential: set GITHUB_PAT, or RUNNER_TOKEN, or install gh (brew install gh)"
   info "Minting a registration token"
   REG_TOKEN="$(curl -fsSL -X POST \
     -H "Authorization: Bearer $PAT" \
