@@ -41,6 +41,14 @@
 #
 set -euo pipefail
 
+# Resolved HERE, before anything cd's. `$0` is whatever the caller typed, and
+# for the documented invocation (`./macos/provision.sh` from the repo root)
+# that is a RELATIVE path. Resolving it later -- after the `cd "$RUNNER_ROOT"`
+# further down -- made `dirname "$0"` point at a ./macos that does not exist
+# there, so the subshell failed, SELF became "/provision.sh", and the copy
+# below aborted the whole run before the runner was ever registered.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 # --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
@@ -264,7 +272,6 @@ fi
 # Install this script beside the runner it provisions, for the same reason the
 # Windows one does: re-running is how a machine is upgraded, and the copy you
 # first ran from is usually somewhere temporary.
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 if [ "$SELF" != "$RUNNER_ROOT/provision.sh" ]; then
   cp -f "$SELF" "$RUNNER_ROOT/provision.sh"
   chmod +x "$RUNNER_ROOT/provision.sh"
