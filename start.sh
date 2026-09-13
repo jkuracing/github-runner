@@ -28,8 +28,13 @@ docker info >/dev/null 2>&1 || die "the docker daemon is not responding -- is Or
 # .env is how this fleet is configured; compose reads it itself, so it is only
 # checked for here, never printed.
 [ -f .env ] || die ".env not found. It must set URL and GITHUB_PAT (see README)."
-grep -q '^URL=' .env        || die ".env has no URL="
-grep -q '^GITHUB_PAT=' .env || die ".env has no GITHUB_PAT= (a runner cannot register without it)"
+# `export KEY=VAL` is accepted, because compose accepts it and this fleet's own
+# .env is written that way. An earlier version matched only '^KEY=' and so
+# refused to start a configuration that compose resolves perfectly well -- a
+# preflight stricter than the thing it guards is worse than no preflight.
+env_has() { grep -qE "^[[:space:]]*(export[[:space:]]+)?$1=" .env; }
+env_has URL        || die ".env sets no URL (looked for 'URL=' or 'export URL=')."
+env_has GITHUB_PAT || die ".env sets no GITHUB_PAT (a runner cannot register without it)"
 
 # A plain string, not an array: macOS ships bash 3.2, where `mapfile` does not
 # exist at all and `${arr[@]}` on an empty array trips `set -u`. Service names
