@@ -156,9 +156,59 @@ Two replicas rather than twelve — x86_64 artifacts are published from pushes t
 `main`, not from every PR, so this is a low-duty-cycle lane sized not to
 compete with the aarch64 fleet for the host.
 
+They start with the rest of the fleet — a plain `docker compose up -d --build`
+brings up all fourteen runners.
+
+**This overcommits memory, deliberately.** Limits are ceilings rather than
+reservations, and OrbStack exposes ~39 GiB to containers, so twelve replicas at
+4 GB were already 48 GB of ceilings against 39 GiB. Fourteen makes it 56 GB.
+That works while replicas do not peak together and gets builds OOM-killed when
+they do. If that starts happening, lower `RUNNER_MEMORY` or run fewer aarch64
+replicas by naming them:
+
 ```bash
-docker compose up -d --build runner-amd64-1 runner-amd64-2
+RUNNER_MEMORY=3g docker compose up -d --build
+docker compose up -d --build runner-1 runner-2 runner-3 runner-amd64-1
 ```
+
+The amd64 image is built with `INSTALL_ESP=0`: this lane builds hbf's Linux
+binaries, and firmware's Xtensa work runs natively on the aarch64 fleet, so the
+ESP toolchain would be dead weight. Its labels are narrowed to
+`hbf-builder-amd64` accordingly — a runner without that toolchain must not
+advertise itself as a firmware builder.
+
+### Rebuilds depend on an unauthenticated GitHub quota
+
+Several steps here fetch from GitHub releases with no token — `espup`, the
+`just` installer, the runner tarball, Pkl. The host gets 60 unauthenticated API
+calls per hour, shared across everything on that IP, and when it runs out a
+rebuild fails in whichever of those steps it reaches first:
+
+```
+espup:  Failed to get latest Xtensa Rust version: ... 403 Forbidden
+just:   curl: (22) The requested URL returned error: 403
+```
+
+Neither is architecture-specific and neither indicates a broken image. Check
+before assuming a real failure:
+
+```bash
+curl -s https://api.github.com/rate_limit | jq .resources.core
+```
+
+### Can x86_64 work leak onto this lane?
+
+Only if a workflow asks for it. Label matching is an exact-string superset
+test, not a prefix match, so `hbf-builder-amd64` does **not** satisfy a job
+requesting `hbf-builder`. Every self-hosted job in the org names an exact
+label today (`[fw-builder]`, `[hbf-builder]`, `[windows-arm64]`), so nothing
+can drift here by accident.
+
+The one way it could: GitHub adds implicit `self-hosted`, `Linux` and `X64` /
+`ARM64` labels to every runner, so a future job written as
+`runs-on: self-hosted` or `runs-on: [self-hosted, Linux]` would match these
+containers as readily as the native ones. Name the builder label explicitly and
+that cannot happen.
 
 ## Windows runners
 
