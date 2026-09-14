@@ -233,7 +233,7 @@ self-hosted Mac these stay stranded:
 
 | workflow | job |
 |---|---|
-| `hbf` publish-gui.yml | the `Hbf.app` bundle (`runs-on: xcode-27`) |
+| `hbf` publish-gui.yml | the `Hbf.app` bundle (`runs-on: [self-hosted, macos-arm64]`) |
 | `hbf` publish-binaries.yml | `macos-aarch64`, `macos-x86_64` |
 
 ```bash
@@ -266,6 +266,13 @@ would queue with no error anywhere — indistinguishable from a stalled fleet
 until you go looking. So the provisioner writes the plist itself, into
 `/Library/LaunchDaemons`, with `RunAtLoad`: it comes up at boot, unattended.
 
+Skipping `svc.sh` means inheriting one step from it: the plist's program is
+`<runner root>/runsvc.sh`, which the tarball ships only as `bin/runsvc.sh`, and
+it is `svc.sh install` that normally copies it up. The provisioner does that
+copy itself. Omitting it is silent in the worst way — launchd exec's a missing
+file, both daemon logs stay zero bytes, `launchctl print` still shows the
+service loaded, and the runner just never comes back after a reboot.
+
 `UserName` is what makes a daemon usable rather than merely early. Homebrew and
 rustup live in your home, so a root-owned daemon would run with a `PATH`
 pointing at a toolchain in `/var/root` that does not exist. Running as the
@@ -293,20 +300,31 @@ Xcode is a ~20 GB Apple-account-gated download, and which version a build
 machine carries is a decision rather than a detail. The script verifies it and
 explains what is wrong instead.
 
-**Version matters.** hbf's `publish-gui.yml` targets the `xcode-27` label
-because Icon Composer saved `hbf-gui/icons/icon.icon` with 27-era features that
-Xcode 26.6's `actool` cannot open. The provisioner derives an `xcode-<major>`
-label from the installed Xcode, so a Mac with 27 picks up that workflow with no
-edit to it — and warns if Xcode is older, since the label would then route work
-to a machine that cannot do it.
+**Version matters.** hbf's `publish-gui.yml` needs Xcode 27 or newer: Icon
+Composer saved `hbf-gui/icons/icon.icon` with 27-era features that Xcode 26.6's
+`actool` cannot open. The provisioner warns when the installed Xcode is older,
+because that job is routed here by `macos-arm64` regardless and will fail in
+`actool`.
+
+No `xcode-<major>` label is published, and that is deliberate — see
+[Labels](#labels).
 
 ### Labels
 
-Default: `macos,macos-<arch>,hbf-builder,xcode-<major>`.
+Default: `macos,macos-<arch>`, on top of the `self-hosted`, `macOS` and `ARM64`
+labels GitHub attaches by itself.
 
 Labels name what the machine **is**, not what it builds — the same rule as the
 Windows runner. An arm64 Mac cross-compiles `x86_64-apple-darwin` perfectly
 well, so `macos-x64` would be a lie that breaks the day an Intel Mac appears.
+
+**No `xcode-<major>` label**, though an earlier version published one. `xcode-27`
+is a GitHub-**hosted** image label: a workflow naming it in `runs-on` goes to
+GitHub's hosted pool however many self-hosted runners carry the same string, so
+it could never steer `publish-gui.yml` here, which is the only thing it was for.
+With no Actions budget the hosted pool kills such a run after six seconds, with
+`runner=null` and an empty log. Publishing a reserved hosted label only invites
+someone to write `runs-on: xcode-27` again.
 
 ### Sharing a host
 

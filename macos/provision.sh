@@ -127,12 +127,21 @@ esac
 # perfectly well, so labelling it "macos-x64" would be a lie that breaks the
 # day someone adds an Intel Mac.
 #
-# `xcode-27` is deliberate and is NOT a description of the hardware: it is the
-# label hbf's publish-gui.yml already targets, because Icon Composer saved
-# hbf-gui/icons/icon.icon with 27-era features that Xcode 26.6's actool cannot
-# open. Carrying the label here lets that workflow move off the hosted image
-# with no edit at all. Drop it from --labels if this Mac is ever downgraded
-# below Xcode 27, or that workflow will be routed here and fail on the icon.
+# `xcode-<major>` is deliberately NOT published, and the reason is worth
+# recording because the opposite was tried. `xcode-27` is a GitHub-HOSTED image
+# label. A workflow naming it in `runs-on` is routed to GitHub's hosted pool no
+# matter how many self-hosted runners advertise the identical string, so the
+# label cannot do the one job it was added for -- steering hbf's publish-gui.yml
+# here. With no Actions budget the hosted pool answers by killing the run after
+# six seconds with runner=null and a zero-byte log; observed twice with this Mac
+# online and idle. publish-gui.yml now asks for `[self-hosted, macos-arm64]`
+# instead, which this runner does serve. Advertising a reserved hosted label
+# only invites someone to write `runs-on: xcode-27` again and lose another
+# afternoon to it.
+#
+# The Xcode VERSION still matters -- see the check further down, which warns
+# when it is older than 27 -- but that is a property to verify, not to publish
+# as a label.
 #
 # `hbf-builder` is deliberately NOT here. Fifteen hbf jobs ask for it -- Format,
 # Lint Rust, Test Rust, Test Rust (client), Test Rust (gui), the drift check, UI
@@ -145,13 +154,10 @@ esac
 # free, which is the hardest kind of CI fault to trust a bisect through.
 #
 # Advertise only what this machine can actually serve. macOS work is addressed
-# by `macos` / `macos-arm64` / `xcode-<major>`.
+# by `macos` / `macos-arm64`, on top of the `self-hosted`, `macOS` and `ARM64`
+# labels GitHub attaches by itself.
 if [ -z "$LABELS" ]; then
   LABELS="macos,macos-${ARCH}"
-  if [ -n "${XCODE_MAJOR:-}" ] || xcodebuild -version >/dev/null 2>&1; then
-    XCODE_MAJOR="${XCODE_MAJOR:-$(xcodebuild -version 2>/dev/null | awk 'NR==1{split($2,v,"."); print v[1]}')}"
-    [ -n "$XCODE_MAJOR" ] && LABELS="${LABELS},xcode-${XCODE_MAJOR}"
-  fi
 fi
 
 if [ "$BUILD_JOBS" -eq 0 ] 2>/dev/null; then
@@ -207,7 +213,8 @@ XCODE_MAJOR="$(xcodebuild -version | awk 'NR==1{split($2,v,"."); print v[1]}')"
 if [ "${XCODE_MAJOR:-0}" -lt 27 ]; then
   warn "Xcode $XCODE_MAJOR is older than 27. hbf's publish-gui.yml will fail in
      actool with \"Could not open\" on hbf-gui/icons/icon.icon, which uses
-     27-era Icon Composer features. Remove xcode-* from --labels, or upgrade."
+     27-era Icon Composer features. Upgrade Xcode, or expect that job to fail:
+     this runner advertises macos-arm64 and will be offered it regardless."
 fi
 
 # The command line tools are separate from Xcode.app and some crates' build
@@ -421,6 +428,22 @@ info "Registering $NAME"
 # nothing now.
 DAEMON_LABEL="actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${NAME}"
 PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+
+# `runsvc.sh` is the plist's ProgramArguments, and nothing has created it yet:
+# the tarball ships it as bin/runsvc.sh, and the copy to the runner root is done
+# by `svc.sh install`, which this script deliberately does not call (that is what
+# would give us a login-time LaunchAgent instead of a boot-time daemon). Skipping
+# svc.sh therefore means inheriting this one step from it.
+#
+# Without it launchd exec's a path that does not exist. It reports that nowhere
+# useful: both daemon logs stay zero bytes, `launchctl print` shows the service
+# loaded, and the runner simply never appears online after a reboot.
+#
+# Unconditional, and before the plist is written, so that re-running this script
+# repairs a machine already installed by a version that omitted it.
+cp -f "$RUNNER_ROOT/bin/runsvc.sh" "$RUNNER_ROOT/runsvc.sh" \
+  || fail "could not copy bin/runsvc.sh to $RUNNER_ROOT/runsvc.sh"
+chmod +x "$RUNNER_ROOT/runsvc.sh"
 
 info "Installing LaunchDaemon $PLIST (runs as $(id -un), starts at boot)"
 sudo tee "$PLIST" >/dev/null <<PLISTEOF
