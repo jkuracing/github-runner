@@ -67,18 +67,33 @@ docker buildx build --platform linux/arm64 -t github-runner .
 
 ### Parallel Jobs
 
-A GitHub Actions runner executes **one job at a time** — there is no concurrency
-setting inside the runner. Total parallelism is therefore just `RUNNER_COUNT`.
+A GitHub Actions runner agent executes **one job at a time**, and there is no
+option to make it take more. That is deliberate rather than a limitation to work
+around: the agent has no isolation boundary inside it, so a job gets `_work`,
+the tool cache, the whole filesystem and every port to itself. Two jobs in one
+agent would race on all of it.
 
-Eight replicas (`runner-1` .. `runner-8`) are declared explicitly in
-`docker-compose.yml`, at 2 CPUs and 6 GB each, sized for a 16-core / 64 GB host.
+**Concurrency therefore means more agents, not busier ones.** That is the
+canonical answer on every platform, and it is what each of the three lanes here
+does:
+
+| Lane | More agents by |
+|---|---|
+| Linux | one container per agent — `runner-1` .. `runner-12` in `docker-compose.yml` |
+| macOS | `./provision.sh -n <N>` |
+| Windows | `.\provision.ps1 -n <N>` |
+
+Twelve aarch64 replicas plus two amd64 are declared explicitly in
+`docker-compose.yml`, at 2 CPUs and 4 GB each (`RUNNER_CPUS`, `RUNNER_MEMORY`).
 `CARGO_BUILD_JOBS` is pinned to `RUNNER_CPUS` — without that, cargo sizes its
-thread pool from the *host* core count and every replica would spawn ~16
-threads, oversubscribing the machine.
+thread pool from the *host* core count and every replica would spawn one thread
+per host core, oversubscribing the machine.
 
-**Memory, not CPU, is what limits the replica count.** 8 x 6 GB = 48 GB of the
-~58 GB the OrbStack VM exposes. Adding replicas without lowering `RUNNER_MEMORY`
-will overcommit and get builds OOM-killed.
+**Memory, not CPU, is what limits the replica count.** The limits are ceilings
+rather than reservations, so overcommitting works right up until several
+replicas peak together and the kernel starts killing builds — which reads as a
+random compiler crash, not as an out-of-memory problem. `start.sh` prints the
+total against what the VM actually has.
 
 A single CI run only reaches 5 concurrent jobs (four checks in parallel, then
 three builds behind `needs`). The reason more replicas still help is that
@@ -326,12 +341,47 @@ With no Actions budget the hosted pool kills such a run after six seconds, with
 `runner=null` and an empty log. Publishing a reserved hosted label only invites
 someone to write `runs-on: xcode-27` again.
 
+### Several runners on one machine
+
+One agent takes one job, so a single Mac serves one macOS job at a time. `-n`
+provisions several agents on the same machine:
+
+```bash
+./provision.sh -n 3               # three runners on this Mac
+./provision.sh -n 3 --instance 2  # re-provision only the second of them
+```
+
+`--instance` matters for upgrades: without it, re-running to fix instance 3
+would tear down and re-register 1 and 2 as well.
+
+**Instance 1 is exactly what a single-instance install has always been** — the
+same `~/actions-runner`, the same name, the same daemon label, the same
+`~/.cargo`. Instances 2..N are siblings with a `-2`, `-3` suffix. Numbering them
+all `-1..-N` would have been tidier, but it would rename the runner on every Mac
+already provisioned, leaving an orphaned registration online in the org and a
+LaunchDaemon the script no longer recognises as its own.
+
+What each instance gets of its own, and why:
+
+| Private per instance | Why it cannot be shared |
+|---|---|
+| `CARGO_HOME` (2..N) | Two concurrent builds on one cargo registry is a *build failure*, not untidiness — this is the `crc32fast … No such file or directory` the Linux fleet hit before every replica got its own registry volume |
+| `SWEEP_WORK_DIR` | Otherwise one instance sweeps another's `target/` mid-compile |
+| `GIT_CONFIG_GLOBAL` | `job-started-hook.sh` resets git's global config before every job; sharing one file means instance 2 wiping it under a job running on instance 1 |
+| runner root, name, daemon label | Registration and launchd both key off these |
+
+The toolchain — Homebrew, rustup, Xcode — stays shared and is installed once.
+
+`CARGO_BUILD_JOBS` is divided by the instance count, because half the cores is
+the budget for runner work as a whole rather than per agent. An explicit
+`--build-jobs` is taken as given and is not divided.
+
 ### Sharing a host
 
-`CARGO_BUILD_JOBS` defaults to half the cores. On the machine this was written
-for, the Mac also hosts the OrbStack Linux fleet and a Parallels VM, and an
-unthrottled native build starves the replicas until their runners drop with
-"lost communication".
+`CARGO_BUILD_JOBS` defaults to half the cores, divided by the instance count.
+On the machine this was written for, the Mac also hosts the OrbStack Linux
+fleet and a Parallels VM, and an unthrottled native build starves the replicas
+until their runners drop with "lost communication".
 
 The disk sweep is the fleet's `job-completed-hook.sh`, reused rather than
 duplicated, at `SWEEP_MAX_GB=8`.
@@ -548,9 +598,45 @@ sweep hook would have failed to parse on every job.
 The Linux entrypoint exports the cargo knobs before `run.sh`; a Windows service
 has no equivalent hook and the runner's `.env` is read only by the Linux
 systemd unit, so `provision.ps1` sets them as **machine-level** environment and
-restarts the service to pick them up.
+restarts the service to pick them up. Values that must differ between instances
+on one machine cannot live there — see "Several runners on one machine" below
+for where those go instead.
 
-`CARGO_BUILD_JOBS` defaults to half the CPUs rather than all of them. This VM
-is expected to share a host with other work, and an unthrottled Windows build
-starves the OrbStack Linux fleet badly enough that its runners drop with "lost
-communication".
+`CARGO_BUILD_JOBS` defaults to half the CPUs rather than all of them, divided
+by the instance count. This VM is expected to share a host with other work, and
+an unthrottled Windows build starves the OrbStack Linux fleet badly enough that
+its runners drop with "lost communication".
+
+### Several runners on one machine
+
+Everything in the macOS "Several runners on one machine" section applies here,
+with PowerShell spelling — and it matters more, because one Windows runner
+serialises every PR that needs Windows.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
+    -ServiceAccount '.\ci' -n 3
+
+# Re-provision only the second of them:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
+    -ServiceAccount '.\ci' -n 3 -Instance 2
+```
+
+Instance 1 keeps `C:\actions-runner` and its existing name and service;
+instances 2..N are `C:\actions-runner-2`, `-3` and so on, each registered under
+its own name and therefore its own `actions.runner.*` service.
+
+**It prompts for the service account password once per instance registered.**
+`config.cmd` is deliberately not run with `--unattended`, so the password is
+typed into the runner rather than passed on a command line where any other
+process could read it. `-n 3` therefore means three prompts.
+
+**Where the per-instance environment lives.** A Windows service cannot read the
+runner's `.env` the way Linux and macOS do, and machine-scope environment holds
+one value per name — so provisioning instance 2 would overwrite instance 1's
+hook paths and point both at one instance's hooks. Each instance's private
+values (`ACTIONS_RUNNER_HOOK_JOB_*`, `SWEEP_WORK_DIR`, `GIT_CONFIG_GLOBAL`,
+`CARGO_HOME`) are therefore written to that service's own `Environment` value
+(`REG_MULTI_SZ`) under `HKLM\SYSTEM\CurrentControlSet\Services\<service>`,
+which the Service Control Manager merges into the process it launches. Values
+that are identical on every instance stay in machine scope, where they were.

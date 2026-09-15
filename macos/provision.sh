@@ -34,6 +34,23 @@
 #
 #   ./provision.sh --dry-run          # derive everything, touch nothing
 #   ./provision.sh --skip-toolchain   # re-register only
+#   ./provision.sh -n 3               # three runners on this Mac
+#   ./provision.sh -n 3 --instance 2  # re-provision only the second of them
+#
+# MULTIPLE INSTANCES
+# ------------------
+# A runner agent takes exactly one job at a time and has no option to take
+# more: it hands the job the whole machine -- $HOME, the tool cache, _work,
+# every port -- with no boundary between one job and the next. Concurrency on
+# one machine therefore means several runner agents, which is what `-n` sets
+# up, and is the same shape the Linux fleet gets from N containers.
+#
+# Instance 1 is deliberately IDENTICAL to what this script produced before -n
+# existed: same $HOME/actions-runner, same name, same daemon label, same
+# ~/.cargo. Instances 2..N are siblings with a -2, -3 suffix. Numbering them
+# all -1..-N would have been tidier, but it would rename the runner on every
+# Mac already provisioned, leaving an orphaned registration online in the org
+# and a LaunchDaemon this script no longer recognises as its own.
 #
 # Run it as yourself, NOT with sudo: the toolchain installs into $HOME, and the
 # single privileged step (installing the LaunchDaemon) calls sudo on its own.
@@ -70,6 +87,13 @@ NAME="${RUNNER_NAME:-mac-$(scutil --get ComputerName 2>/dev/null | tr ' ' '-' | 
 LABELS="${RUNNER_LABELS:-}"
 BUILD_JOBS="${BUILD_JOBS:-0}"
 SWEEP_MAX_GB="${SWEEP_MAX_GB:-8}"
+# How many runner agents this Mac should host, and optionally which single one
+# of them to act on. ONLY_INSTANCE is what makes upgrading one instance safe:
+# without it, re-running to fix instance 3 would tear down and re-register 1
+# and 2 as well, which means three registration churns and three daemon
+# restarts to fix one machine.
+INSTANCES="${INSTANCES:-1}"
+ONLY_INSTANCE=""
 SKIP_TOOLCHAIN=false
 SKIP_REGISTRATION=false
 DRY_RUN=false
@@ -84,10 +108,15 @@ while [ $# -gt 0 ]; do
     --runner-root)      RUNNER_ROOT="$2"; shift 2 ;;
     --runner-version)   RUNNER_VERSION="$2"; shift 2 ;;
     --build-jobs)       BUILD_JOBS="$2"; shift 2 ;;
+    -n|--instances)     INSTANCES="$2"; shift 2 ;;
+    --instance)         ONLY_INSTANCE="$2"; shift 2 ;;
     --skip-toolchain)   SKIP_TOOLCHAIN=true; shift ;;
     --skip-registration) SKIP_REGISTRATION=true; shift ;;
     --dry-run)          DRY_RUN=true; shift ;;
-    -h|--help)          sed -n '2,36p' "$0"; exit 0 ;;
+    # The header IS the help, printed from line 2 to the last comment line
+    # before the first statement. Derived rather than a hardcoded range: the
+    # range was '2,36p' and had already fallen behind the header it prints.
+    -h|--help)          sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -160,14 +189,61 @@ if [ -z "$LABELS" ]; then
   LABELS="macos,macos-${ARCH}"
 fi
 
+case "$INSTANCES" in
+  ''|*[!0-9]*) fail "--instances takes a positive integer, got: $INSTANCES" ;;
+esac
+[ "$INSTANCES" -ge 1 ] || fail "--instances must be at least 1, got: $INSTANCES"
+if [ -n "$ONLY_INSTANCE" ]; then
+  case "$ONLY_INSTANCE" in
+    ''|*[!0-9]*) fail "--instance takes a positive integer, got: $ONLY_INSTANCE" ;;
+  esac
+  { [ "$ONLY_INSTANCE" -ge 1 ] && [ "$ONLY_INSTANCE" -le "$INSTANCES" ]; } \
+    || fail "--instance $ONLY_INSTANCE is outside 1..$INSTANCES (pass -n $ONLY_INSTANCE or higher)"
+fi
+
 if [ "$BUILD_JOBS" -eq 0 ] 2>/dev/null; then
   # Half the cores, because this Mac is expected to share itself with other
   # work. On the machine this was written for it also hosts the OrbStack Linux
   # fleet and a Parallels VM, and an unthrottled native build starves the
   # replicas badly enough that their runners drop with "lost communication".
-  BUILD_JOBS=$(( $(sysctl -n hw.ncpu) / 2 ))
+  #
+  # Divided again by the instance count, because that half is the budget for
+  # RUNNER work as a whole, not per agent: N instances each sized for half the
+  # box would oversubscribe it by N and reproduce exactly the starvation this
+  # cap exists to prevent. An explicit --build-jobs is taken as given and is
+  # NOT divided -- it is already an answer to this question.
+  BUILD_JOBS=$(( $(sysctl -n hw.ncpu) / 2 / INSTANCES ))
   [ "$BUILD_JOBS" -lt 1 ] && BUILD_JOBS=1
 fi
+
+# --------------------------------------------------------------------------
+# Per-instance derivation
+#
+# Instance 1 keeps every path and name this script used before -n existed; see
+# the MULTIPLE INSTANCES note in the header for why the numbering is offset
+# rather than uniform. Everything an instance must not share with its siblings
+# is derived here, in one place, so the answer to "what is private to an
+# instance?" is readable rather than scattered.
+# --------------------------------------------------------------------------
+
+instance_suffix() { [ "$1" -eq 1 ] && printf '' || printf -- '-%s' "$1"; }
+instance_root()   { printf '%s%s' "$RUNNER_ROOT" "$(instance_suffix "$1")"; }
+instance_name()   { printf '%s%s' "$NAME" "$(instance_suffix "$1")"; }
+
+# CARGO_HOME is the one that bites hardest. Two concurrent builds sharing a
+# cargo registry is not a tidiness problem, it is a build failure: the Linux
+# fleet gives every replica its own registry volume after sharing one produced
+#   error: could not compile `crc32fast` (lib)
+#   Caused by: No such file or directory (os error 2)
+# when another container's cargo garbage-collected unpacked sources mid-compile.
+# Same user, same $HOME, same registry here -- so instances 2..N get their own.
+#
+# Instance 1 keeps ~/.cargo: it is already warm on every provisioned Mac, and
+# moving it would re-download the index and every crate for no isolation gain
+# (it is isolated from 2..N either way).
+instance_cargo_home() {
+  [ "$1" -eq 1 ] && printf '%s/.cargo' "$HOME" || printf '%s/.cargo' "$(instance_root "$1")"
+}
 
 # Strip the host BEFORE counting separators. Matching slashes on the whole URL
 # looks right and is not: "https://github.com/jkuracing" already carries three,
@@ -182,13 +258,21 @@ case "$SLUG" in
 esac
 
 info "Architecture    : $ARCH (runner package: $RUNNER_ARCH)"
-info "Runner name     : $NAME"
 info "Labels          : $LABELS"
 info "Runs as         : $(id -un) (LaunchDaemon, starts at boot)"
-info "CARGO_BUILD_JOBS: $BUILD_JOBS"
+info "CARGO_BUILD_JOBS: $BUILD_JOBS (per instance)"
 info "Registration    : $SCOPE — $API"
-info "Runner root     : $RUNNER_ROOT (actions-runner ${RUNNER_VERSION:-latest})"
+info "Runner package  : actions-runner ${RUNNER_VERSION:-latest}"
 info "Xcode           : $(xcodebuild -version 2>/dev/null | head -1 || echo 'NOT FOUND')"
+info "Instances       : $INSTANCES${ONLY_INSTANCE:+ (acting on #$ONLY_INSTANCE only)}"
+
+# The instance table is the whole point of --dry-run now: everything that must
+# differ between siblings is derived above, so printing it here is what makes a
+# derivation bug visible before it reaches a machine rather than after.
+for i in $(seq 1 "$INSTANCES"); do
+  [ -n "$ONLY_INSTANCE" ] && [ "$i" != "$ONLY_INSTANCE" ] && continue
+  info "  #$i  name=$(instance_name "$i")  root=$(instance_root "$i")  CARGO_HOME=$(instance_cargo_home "$i")"
+done
 
 if [ "$DRY_RUN" = true ]; then
   info "--dry-run: nothing was changed."
@@ -255,11 +339,11 @@ if [ "$SKIP_TOOLCHAIN" = false ]; then
 fi
 
 # --------------------------------------------------------------------------
-# Runner
+# Runner package version
+#
+# Resolved once, ahead of the per-instance loop: it is a network call, and
+# every instance on this Mac installs the same release.
 # --------------------------------------------------------------------------
-
-mkdir -p "$RUNNER_ROOT"
-cd "$RUNNER_ROOT"
 
 if [ -z "$RUNNER_VERSION" ]; then
   RUNNER_VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
@@ -267,67 +351,16 @@ if [ -z "$RUNNER_VERSION" ]; then
   [ -n "$RUNNER_VERSION" ] || fail "could not resolve the latest actions/runner release"
 fi
 
-if [ ! -x "$RUNNER_ROOT/config.sh" ]; then
-  TARBALL="actions-runner-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
-  info "Downloading $TARBALL"
-  curl -fsSLo "/tmp/$TARBALL" \
-    "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}"
-  tar xzf "/tmp/$TARBALL" -C "$RUNNER_ROOT"
-  rm -f "/tmp/$TARBALL"
-fi
-
-# Install this script beside the runner it provisions, for the same reason the
-# Windows one does: re-running is how a machine is upgraded, and the copy you
-# first ran from is usually somewhere temporary.
-if [ "$SELF" != "$RUNNER_ROOT/provision.sh" ]; then
-  cp -f "$SELF" "$RUNNER_ROOT/provision.sh"
-  chmod +x "$RUNNER_ROOT/provision.sh"
-  info "Installed this script to $RUNNER_ROOT/provision.sh"
-fi
-
 # --------------------------------------------------------------------------
-# Job hooks
+# Registration token
 #
-# Fetched from this repo rather than embedded: unlike Windows, macOS runs the
-# same bash hooks the Linux fleet does, so duplicating them here would mean two
-# copies to keep in step. The sweep budget is the only knob that differs.
-# --------------------------------------------------------------------------
-
-mkdir -p "$RUNNER_ROOT/hooks"
-for hook in job-started-hook.sh job-completed-hook.sh; do
-  if [ -f "$(dirname "$SELF")/../$hook" ]; then
-    cp -f "$(dirname "$SELF")/../$hook" "$RUNNER_ROOT/hooks/$hook"
-  else
-    curl -fsSLo "$RUNNER_ROOT/hooks/$hook" \
-      "https://raw.githubusercontent.com/jkuracing/github-runner/main/$hook" \
-      || fail "could not obtain $hook"
-  fi
-  chmod +x "$RUNNER_ROOT/hooks/$hook"
-done
-info "Hooks installed to $RUNNER_ROOT/hooks"
-
-cat > "$RUNNER_ROOT/.env" <<ENV
-CARGO_BUILD_JOBS=$BUILD_JOBS
-CARGO_INCREMENTAL=0
-CARGO_PROFILE_DEV_DEBUG=line-tables-only
-ACTIONS_RUNNER_HOOK_JOB_STARTED=$RUNNER_ROOT/hooks/job-started-hook.sh
-ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$RUNNER_ROOT/hooks/job-completed-hook.sh
-SWEEP_MAX_GB=$SWEEP_MAX_GB
-PATH=$HOME/.cargo/bin:$(dirname "$BREW" 2>/dev/null || echo /opt/homebrew/bin):/usr/bin:/bin:/usr/sbin:/sbin
-ENV
-info "Wrote $RUNNER_ROOT/.env"
-
-if [ "$SKIP_REGISTRATION" = true ]; then
-  info "Toolchain installed; registration skipped."
-  exit 0
-fi
-
-# --------------------------------------------------------------------------
-# Registration
-# --------------------------------------------------------------------------
-
-# Three ways to get a registration token, tried in order, matching
-# windows/provision.ps1:
+# Minted ONCE and reused by every instance. A registration token is not tied to
+# a runner -- it authorises registering against this org or repo for about an
+# hour -- so minting one per instance would mean N API calls, N chances to fail
+# partway through a fleet, and on the gh path potentially N interactive
+# prompts, all to obtain N interchangeable secrets.
+#
+# Three ways to get one, tried in order, matching windows/provision.ps1:
 #
 #   RUNNER_TOKEN  one minted elsewhere -- keeps a PAT off this machine entirely
 #   GITHUB_PAT    a classic PAT
@@ -339,151 +372,315 @@ fi
 # gh's ordinary login carries read:org while registering an ORG runner needs
 # admin:org -- so rather than telling you that, this asks gh to widen its own
 # scope when a mint is refused.
-if [ -z "$REG_TOKEN" ] && [ -z "$PAT" ] && command -v gh >/dev/null 2>&1; then
-  gh_scope=admin:org
-  [ "$SCOPE" = repo ] && gh_scope=repo
+# --------------------------------------------------------------------------
 
-  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
-    info "gh is not logged in; starting gh auth login"
-    gh auth login --hostname github.com --scopes "$gh_scope" \
-      || fail "gh auth login failed. Pass --pat, or set RUNNER_TOKEN."
-  fi
+if [ "$SKIP_REGISTRATION" = false ]; then
+  if [ -z "$REG_TOKEN" ] && [ -z "$PAT" ] && command -v gh >/dev/null 2>&1; then
+    gh_scope=admin:org
+    [ "$SCOPE" = repo ] && gh_scope=repo
 
-  info "Minting a registration token via gh"
-  REG_TOKEN="$(gh api -X POST "$API" --jq .token 2>/dev/null || true)"
+    if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+      info "gh is not logged in; starting gh auth login"
+      gh auth login --hostname github.com --scopes "$gh_scope" \
+        || fail "gh auth login failed. Pass --pat, or set RUNNER_TOKEN."
+    fi
 
-  if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = null ]; then
-    # Logged in but refused: overwhelmingly the scope. Ask for it rather than
-    # printing an instruction and exiting.
-    info "gh could not mint a token; requesting the '$gh_scope' scope"
-    gh auth refresh --hostname github.com --scopes "$gh_scope" \
-      || fail "gh auth refresh failed. Pass --pat, or set RUNNER_TOKEN."
+    info "Minting a registration token via gh"
     REG_TOKEN="$(gh api -X POST "$API" --jq .token 2>/dev/null || true)"
+
+    if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = null ]; then
+      # Logged in but refused: overwhelmingly the scope. Ask for it rather than
+      # printing an instruction and exiting.
+      info "gh could not mint a token; requesting the '$gh_scope' scope"
+      gh auth refresh --hostname github.com --scopes "$gh_scope" \
+        || fail "gh auth refresh failed. Pass --pat, or set RUNNER_TOKEN."
+      REG_TOKEN="$(gh api -X POST "$API" --jq .token 2>/dev/null || true)"
+    fi
+
+    [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != null ] \
+      || fail "gh still could not mint a registration token for $API (scope: $gh_scope)"
   fi
 
-  [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != null ] \
-    || fail "gh still could not mint a registration token for $API (scope: $gh_scope)"
-fi
-
-if [ -z "$REG_TOKEN" ]; then
-  [ -n "$PAT" ] || fail "no credential: set GITHUB_PAT, or RUNNER_TOKEN, or install gh (brew install gh)"
-  info "Minting a registration token"
-  REG_TOKEN="$(curl -fsSL -X POST \
-    -H "Authorization: Bearer $PAT" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/$API" | jq -r .token)"
-  [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != null ] \
-    || fail "could not mint a registration token — check the PAT's scope ($SCOPE)"
-fi
-
-# config.sh refuses to reconfigure an existing registration, and the daemon
-# holds the runner binary open, so an upgrade run has to unwind both. Any
-# actions.runner daemon here is ours, whatever it was labelled on a previous
-# run -- the name or the org could have changed since.
-for old_plist in /Library/LaunchDaemons/actions.runner.*.plist; do
-  [ -e "$old_plist" ] || continue
-  if grep -q "$RUNNER_ROOT" "$old_plist" 2>/dev/null; then
-    info "Stopping the existing daemon ($(basename "$old_plist"))"
-    sudo launchctl bootout system "$old_plist" 2>/dev/null || true
-    sudo rm -f "$old_plist"
+  if [ -z "$REG_TOKEN" ]; then
+    [ -n "$PAT" ] || fail "no credential: set GITHUB_PAT, or RUNNER_TOKEN, or install gh (brew install gh)"
+    info "Minting a registration token"
+    REG_TOKEN="$(curl -fsSL -X POST \
+      -H "Authorization: Bearer $PAT" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/$API" | jq -r .token)"
+    [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != null ] \
+      || fail "could not mint a registration token — check the PAT's scope ($SCOPE)"
   fi
-done
-# A LaunchAgent from an earlier version of this script, or from `svc.sh`.
-if [ -f "$RUNNER_ROOT/svc.sh" ] && ./svc.sh status >/dev/null 2>&1; then
-  info "Removing the previous LaunchAgent"
-  ./svc.sh stop || true
-  ./svc.sh uninstall || true
-fi
-if [ -f "$RUNNER_ROOT/.runner" ]; then
-  info "Removing the previous registration"
-  ./config.sh remove --token "$REG_TOKEN" || warn "remove failed; continuing to reconfigure"
 fi
 
-info "Registering $NAME"
-./config.sh \
-  --unattended --replace \
-  --url "$URL" \
-  --token "$REG_TOKEN" \
-  --name "$NAME" \
-  --labels "$LABELS" \
-  --work _work
+# --------------------------------------------------------------------------
+# provision_instance <index>
+#
+# Everything that belongs to ONE runner agent: its directory, its hooks, its
+# environment, its registration and its daemon. The toolchain above is shared
+# and deliberately outside this -- Homebrew, rustup and Xcode are per machine,
+# not per runner, and installing them N times would only be slower.
+# --------------------------------------------------------------------------
 
-# A LaunchDaemon, not the LaunchAgent `svc.sh install` would create.
-#
-# svc.sh writes ~/Library/LaunchAgents/..., and an agent starts at LOGIN. After
-# a reboot the runner would not come back until someone logged in, and jobs
-# would sit queued with no error anywhere -- indistinguishable from a stalled
-# fleet until you go looking. This machine is meant to be unattended, so the
-# plist is written here instead.
-#
-# `UserName` is what makes a daemon usable rather than merely early: Homebrew
-# and rustup live in this user's home, so a root-owned daemon would run with a
-# PATH pointing at a toolchain in /var/root that does not exist. Running as the
-# invoking user keeps the toolchain, the cargo registry and the sccache config
-# exactly where the toolchain step put them.
-#
-# SessionCreate gives the job its own security session. Not needed for today's
-# ad-hoc signing (publish-gui.yml asserts `Signature=adhoc`), but it is what a
-# Developer ID identity in the login keychain would later need, and it costs
-# nothing now.
-DAEMON_LABEL="actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${NAME}"
-PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+provision_instance() {
+  idx="$1"
+  inst_root="$(instance_root "$idx")"
+  inst_name="$(instance_name "$idx")"
+  inst_cargo="$(instance_cargo_home "$idx")"
 
-# `runsvc.sh` is the plist's ProgramArguments, and nothing has created it yet:
-# the tarball ships it as bin/runsvc.sh, and the copy to the runner root is done
-# by `svc.sh install`, which this script deliberately does not call (that is what
-# would give us a login-time LaunchAgent instead of a boot-time daemon). Skipping
-# svc.sh therefore means inheriting this one step from it.
-#
-# Without it launchd exec's a path that does not exist. It reports that nowhere
-# useful: both daemon logs stay zero bytes, `launchctl print` shows the service
-# loaded, and the runner simply never appears online after a reboot.
-#
-# Unconditional, and before the plist is written, so that re-running this script
-# repairs a machine already installed by a version that omitted it.
-cp -f "$RUNNER_ROOT/bin/runsvc.sh" "$RUNNER_ROOT/runsvc.sh" \
-  || fail "could not copy bin/runsvc.sh to $RUNNER_ROOT/runsvc.sh"
-chmod +x "$RUNNER_ROOT/runsvc.sh"
+  info ""
+  info "=== instance #$idx: $inst_name ($inst_root) ==="
 
-info "Installing LaunchDaemon $PLIST (runs as $(id -un), starts at boot)"
-sudo tee "$PLIST" >/dev/null <<PLISTEOF
+  mkdir -p "$inst_root"
+  cd "$inst_root"
+
+  if [ ! -x "$inst_root/config.sh" ]; then
+    TARBALL="actions-runner-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+    # Downloaded once and kept for the rest of the run: every instance installs
+    # the same release, and re-fetching ~200 MB per instance would be the
+    # slowest part of provisioning a multi-instance machine. Removed after the
+    # loop rather than here.
+    if [ ! -f "/tmp/$TARBALL" ]; then
+      info "Downloading $TARBALL"
+      curl -fsSLo "/tmp/$TARBALL" \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}"
+    fi
+    info "Extracting runner to $inst_root"
+    tar xzf "/tmp/$TARBALL" -C "$inst_root"
+  fi
+
+  # Install this script beside the runner it provisions, for the same reason
+  # the Windows one does: re-running is how a machine is upgraded, and the copy
+  # you first ran from is usually somewhere temporary. Written into every
+  # instance root rather than just the first so that no root depends on another
+  # one still existing, and rewritten on every run so the copies cannot drift.
+  if [ "$SELF" != "$inst_root/provision.sh" ]; then
+    cp -f "$SELF" "$inst_root/provision.sh"
+    chmod +x "$inst_root/provision.sh"
+  fi
+
+  # ------------------------------------------------------------------------
+  # Job hooks
+  #
+  # Fetched from this repo rather than embedded: unlike Windows, macOS runs the
+  # same bash hooks the Linux fleet does, so duplicating them here would mean
+  # two copies to keep in step. The sweep budget is the only knob that differs.
+  # ------------------------------------------------------------------------
+
+  mkdir -p "$inst_root/hooks"
+  for hook in job-started-hook.sh job-completed-hook.sh; do
+    if [ -f "$(dirname "$SELF")/../$hook" ]; then
+      cp -f "$(dirname "$SELF")/../$hook" "$inst_root/hooks/$hook"
+    else
+      curl -fsSLo "$inst_root/hooks/$hook" \
+        "https://raw.githubusercontent.com/jkuracing/github-runner/main/$hook" \
+        || fail "could not obtain $hook"
+    fi
+    chmod +x "$inst_root/hooks/$hook"
+  done
+  info "Hooks installed to $inst_root/hooks"
+
+  # PATH puts this instance's CARGO_HOME/bin first so that `cargo install`ed
+  # tools resolve to the ones this instance owns. For instance 1 that IS
+  # ~/.cargo/bin, so it is not listed twice.
+  inst_path="$inst_cargo/bin"
+  [ "$inst_cargo" = "$HOME/.cargo" ] || inst_path="$inst_path:$HOME/.cargo/bin"
+  # ${BREW:-...} rather than a bare $BREW: BREW is only assigned inside the
+  # toolchain block, so under --skip-toolchain (the documented "re-register
+  # only" path) `set -u` would abort here on an unbound variable.
+  inst_path="$inst_path:$(dirname "${BREW:-/opt/homebrew/bin/brew}"):/usr/bin:/bin:/usr/sbin:/sbin"
+
+  # SWEEP_WORK_DIR is not optional here, and was missing before -n existed.
+  # job-completed-hook.sh defaults it to /actions-runner/_work -- the path
+  # inside a fleet CONTAINER, which does not exist on a Mac -- so the hook hit
+  # its `[[ -d "$WORK_DIR" ]] || exit 0` guard and returned without sweeping
+  # anything, every time. The disk budget has therefore never been enforced on
+  # macOS. With several instances it also has to name THIS instance's _work, or
+  # one instance would sweep another's build tree mid-compile.
+  #
+  # GIT_CONFIG_GLOBAL for the reason job-started-hook.sh now explains: that
+  # hook resets git's global config before every job, and every instance on
+  # this Mac runs as the same user. Sharing one ~/.gitconfig would mean
+  # instance 2 starting a job deletes the config instance 1 is mid-job using.
+  cat > "$inst_root/.env" <<ENV
+CARGO_BUILD_JOBS=$BUILD_JOBS
+CARGO_INCREMENTAL=0
+CARGO_PROFILE_DEV_DEBUG=line-tables-only
+CARGO_HOME=$inst_cargo
+ACTIONS_RUNNER_HOOK_JOB_STARTED=$inst_root/hooks/job-started-hook.sh
+ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$inst_root/hooks/job-completed-hook.sh
+SWEEP_MAX_GB=$SWEEP_MAX_GB
+SWEEP_WORK_DIR=$inst_root/_work
+GIT_CONFIG_GLOBAL=$inst_root/.gitconfig
+PATH=$inst_path
+ENV
+  info "Wrote $inst_root/.env"
+
+  if [ "$SKIP_REGISTRATION" = true ]; then
+    info "Toolchain installed; registration skipped for #$idx."
+    return 0
+  fi
+
+  # ------------------------------------------------------------------------
+  # Registration
+  # ------------------------------------------------------------------------
+
+  # config.sh refuses to reconfigure an existing registration, and the daemon
+  # holds the runner binary open, so an upgrade run has to unwind both. Any
+  # actions.runner daemon pointing at THIS instance's root is ours, whatever it
+  # was labelled on a previous run -- the name or the org could have changed
+  # since.
+  #
+  # The match is on the exact WorkingDirectory element, not a bare grep for the
+  # root. A substring test looks equivalent and is not: "actions-runner" is a
+  # prefix of "actions-runner-2", so provisioning instance 1 would find its own
+  # root inside instance 2's plist and bootout a healthy sibling -- which reads
+  # as a runner that mysteriously went offline while a different one was being
+  # upgraded. The closing tag is what makes the comparison exact.
+  for old_plist in /Library/LaunchDaemons/actions.runner.*.plist; do
+    [ -e "$old_plist" ] || continue
+    if grep -qF "<string>${inst_root}</string>" "$old_plist" 2>/dev/null; then
+      info "Stopping the existing daemon ($(basename "$old_plist"))"
+      sudo launchctl bootout system "$old_plist" 2>/dev/null || true
+      sudo rm -f "$old_plist"
+    fi
+  done
+  # A LaunchAgent from an earlier version of this script, or from `svc.sh`.
+  #
+  # Gated on the agent plist actually existing, not on `svc.sh status`. That
+  # exits 0 even when it has just printed "not installed", so the old guard
+  # fired on every run and spent two stop/uninstall cycles failing at a
+  # LaunchAgent that was never there -- printing "Unload failed: 5:
+  # Input/output error" and "Failed: failed to delete ...", which look like a
+  # broken provision and are merely noise. svc.sh names its agent with the same
+  # label this script gives the daemon, so the plist path is predictable.
+  agent_plist="$HOME/Library/LaunchAgents/actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${inst_name}.plist"
+  if [ -f "$agent_plist" ] && [ -f "$inst_root/svc.sh" ]; then
+    info "Removing the previous LaunchAgent ($(basename "$agent_plist"))"
+    ./svc.sh stop || true
+    ./svc.sh uninstall || true
+  fi
+  if [ -f "$inst_root/.runner" ]; then
+    info "Removing the previous registration"
+    ./config.sh remove --token "$REG_TOKEN" || warn "remove failed; continuing to reconfigure"
+  fi
+
+  info "Registering $inst_name"
+  ./config.sh \
+    --unattended --replace \
+    --url "$URL" \
+    --token "$REG_TOKEN" \
+    --name "$inst_name" \
+    --labels "$LABELS" \
+    --work _work
+
+  # A LaunchDaemon, not the LaunchAgent `svc.sh install` would create.
+  #
+  # svc.sh writes ~/Library/LaunchAgents/..., and an agent starts at LOGIN.
+  # After a reboot the runner would not come back until someone logged in, and
+  # jobs would sit queued with no error anywhere -- indistinguishable from a
+  # stalled fleet until you go looking. This machine is meant to be unattended,
+  # so the plist is written here instead.
+  #
+  # `UserName` is what makes a daemon usable rather than merely early: Homebrew
+  # and rustup live in this user's home, so a root-owned daemon would run with
+  # a PATH pointing at a toolchain in /var/root that does not exist. Running as
+  # the invoking user keeps the toolchain, the cargo registry and the sccache
+  # config exactly where the toolchain step put them.
+  #
+  # SessionCreate gives the job its own security session. Not needed for
+  # today's ad-hoc signing (publish-gui.yml asserts `Signature=adhoc`), but it
+  # is what a Developer ID identity in the login keychain would later need, and
+  # it costs nothing now.
+  #
+  # The label carries the instance's name, which is unique per instance, so N
+  # instances install N distinct daemons rather than fighting over one.
+  DAEMON_LABEL="actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${inst_name}"
+  PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+
+  # `runsvc.sh` is the plist's ProgramArguments, and nothing has created it yet:
+  # the tarball ships it as bin/runsvc.sh, and the copy to the runner root is
+  # done by `svc.sh install`, which this script deliberately does not call (that
+  # is what would give us a login-time LaunchAgent instead of a boot-time
+  # daemon). Skipping svc.sh therefore means inheriting this one step from it.
+  #
+  # Without it launchd exec's a path that does not exist. It reports that
+  # nowhere useful: both daemon logs stay zero bytes, `launchctl print` shows
+  # the service loaded, and the runner simply never appears online after a
+  # reboot.
+  #
+  # Unconditional, and before the plist is written, so that re-running this
+  # script repairs a machine already installed by a version that omitted it.
+  cp -f "$inst_root/bin/runsvc.sh" "$inst_root/runsvc.sh" \
+    || fail "could not copy bin/runsvc.sh to $inst_root/runsvc.sh"
+  chmod +x "$inst_root/runsvc.sh"
+
+  info "Installing LaunchDaemon $PLIST (runs as $(id -un), starts at boot)"
+  sudo tee "$PLIST" >/dev/null <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${DAEMON_LABEL}</string>
   <key>ProgramArguments</key>
-  <array><string>${RUNNER_ROOT}/runsvc.sh</string></array>
-  <key>WorkingDirectory</key><string>${RUNNER_ROOT}</string>
+  <array><string>${inst_root}/runsvc.sh</string></array>
+  <key>WorkingDirectory</key><string>${inst_root}</string>
   <key>UserName</key><string>$(id -un)</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>SessionCreate</key><true/>
-  <key>StandardOutPath</key><string>${RUNNER_ROOT}/_diag/daemon.out.log</string>
-  <key>StandardErrorPath</key><string>${RUNNER_ROOT}/_diag/daemon.err.log</string>
+  <key>StandardOutPath</key><string>${inst_root}/_diag/daemon.out.log</string>
+  <key>StandardErrorPath</key><string>${inst_root}/_diag/daemon.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>${HOME}</string>
-    <key>PATH</key><string>${HOME}/.cargo/bin:$(dirname "${BREW:-/opt/homebrew/bin/brew}"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>${inst_path}</string>
   </dict>
 </dict>
 </plist>
 PLISTEOF
-sudo chown root:wheel "$PLIST"
-sudo chmod 644 "$PLIST"
-mkdir -p "$RUNNER_ROOT/_diag"
+  sudo chown root:wheel "$PLIST"
+  sudo chmod 644 "$PLIST"
+  mkdir -p "$inst_root/_diag"
 
-# bootout first so a re-run replaces cleanly; it fails when nothing is loaded,
-# which is fine and is why the failure is swallowed.
-sudo launchctl bootout system "$PLIST" 2>/dev/null || true
-sudo launchctl bootstrap system "$PLIST"
-sudo launchctl enable "system/${DAEMON_LABEL}"
-sleep 2
-sudo launchctl print "system/${DAEMON_LABEL}" 2>/dev/null | sed -n '1,6p' || \
-  warn "launchctl print failed; check $RUNNER_ROOT/_diag/daemon.err.log"
+  # bootout first so a re-run replaces cleanly; it fails when nothing is loaded,
+  # which is fine and is why the failure is swallowed.
+  sudo launchctl bootout system "$PLIST" 2>/dev/null || true
+  sudo launchctl bootstrap system "$PLIST"
+  sudo launchctl enable "system/${DAEMON_LABEL}"
+  sleep 2
+  sudo launchctl print "system/${DAEMON_LABEL}" 2>/dev/null | sed -n '1,6p' || \
+    warn "launchctl print failed; check $inst_root/_diag/daemon.err.log"
+}
+
+for i in $(seq 1 "$INSTANCES"); do
+  if [ -n "$ONLY_INSTANCE" ] && [ "$i" != "$ONLY_INSTANCE" ]; then
+    continue
+  fi
+  provision_instance "$i"
+done
+
+# The shared download, now that every instance has unpacked it.
+rm -f "/tmp/actions-runner-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 
 info ""
-info "Done. The runner should now appear under the org's Actions > Runners"
-info "with labels: $LABELS"
+if [ "$SKIP_REGISTRATION" = true ]; then
+  # Nothing was registered, so promising a runner in the org's list would be a
+  # lie -- and one that reads as a failure when nothing turns up there.
+  info "Done. Toolchain and runner directories are ready; nothing was registered."
+  info "Re-run without --skip-registration to register and install the daemons."
+else
+  if [ -n "$ONLY_INSTANCE" ]; then
+    info "Done. Instance #$ONLY_INSTANCE should now appear under the org's Actions > Runners"
+  else
+    info "Done. $INSTANCES runner(s) should now appear under the org's Actions > Runners"
+  fi
+  info "with labels: $LABELS"
+fi
 info ""
-info "Re-run to upgrade:  $RUNNER_ROOT/provision.sh"
+if [ "$INSTANCES" -gt 1 ]; then
+  info "Re-run to upgrade all:  $(instance_root 1)/provision.sh -n $INSTANCES"
+  info "Re-run to upgrade one:  $(instance_root 1)/provision.sh -n $INSTANCES --instance <i>"
+else
+  info "Re-run to upgrade:  $(instance_root 1)/provision.sh"
+fi
