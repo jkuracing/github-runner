@@ -655,12 +655,19 @@ done
 rm -f "/tmp/actions-runner-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 
 info ""
-if [ -n "$ONLY_INSTANCE" ]; then
-  info "Done. Instance #$ONLY_INSTANCE should now appear under the org's Actions > Runners"
+if [ "$SKIP_REGISTRATION" = true ]; then
+  # Nothing was registered, so promising a runner in the org's list would be a
+  # lie -- and one that reads as a failure when nothing turns up there.
+  info "Done. Toolchain and runner directories are ready; nothing was registered."
+  info "Re-run without --skip-registration to register and install the daemons."
 else
-  info "Done. $INSTANCES runner(s) should now appear under the org's Actions > Runners"
+  if [ -n "$ONLY_INSTANCE" ]; then
+    info "Done. Instance #$ONLY_INSTANCE should now appear under the org's Actions > Runners"
+  else
+    info "Done. $INSTANCES runner(s) should now appear under the org's Actions > Runners"
+  fi
+  info "with labels: $LABELS"
 fi
-info "with labels: $LABELS"
 info ""
 if [ "$INSTANCES" -gt 1 ]; then
   info "Re-run to upgrade all:  $(instance_root 1)/provision.sh -n $INSTANCES"
