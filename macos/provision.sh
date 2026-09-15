@@ -546,8 +546,17 @@ ENV
     fi
   done
   # A LaunchAgent from an earlier version of this script, or from `svc.sh`.
-  if [ -f "$inst_root/svc.sh" ] && ./svc.sh status >/dev/null 2>&1; then
-    info "Removing the previous LaunchAgent"
+  #
+  # Gated on the agent plist actually existing, not on `svc.sh status`. That
+  # exits 0 even when it has just printed "not installed", so the old guard
+  # fired on every run and spent two stop/uninstall cycles failing at a
+  # LaunchAgent that was never there -- printing "Unload failed: 5:
+  # Input/output error" and "Failed: failed to delete ...", which look like a
+  # broken provision and are merely noise. svc.sh names its agent with the same
+  # label this script gives the daemon, so the plist path is predictable.
+  agent_plist="$HOME/Library/LaunchAgents/actions.runner.$(printf '%s' "$SLUG" | tr '/' '-').${inst_name}.plist"
+  if [ -f "$agent_plist" ] && [ -f "$inst_root/svc.sh" ]; then
+    info "Removing the previous LaunchAgent ($(basename "$agent_plist"))"
     ./svc.sh stop || true
     ./svc.sh uninstall || true
   fi
