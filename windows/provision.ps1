@@ -84,6 +84,29 @@ param(
   # explicitly only to reproduce a specific machine.
   [string] $RunnerVersion  = '',
   [int]    $BuildJobs      = 0,
+  # How many runner agents this machine should host.
+  #
+  # A runner agent takes exactly one job at a time and has no option to take
+  # more: it hands the job the whole machine -- the service account's profile,
+  # the tool cache, _work, every port -- with no boundary between one job and
+  # the next. Concurrency on one machine therefore means several agents, which
+  # is what this sets up, and is the same shape the Linux fleet gets from N
+  # containers. Worth having here specifically because one Windows runner
+  # serialises every PR that needs Windows.
+  #
+  # Instance 1 is deliberately IDENTICAL to what this script produced before
+  # -Instances existed: same C:\actions-runner, same name, same service.
+  # Instances 2..N are siblings with a -2, -3 suffix. Numbering them all
+  # -1..-N would have been tidier, but it would rename the runner on every
+  # machine already provisioned, leaving an orphaned registration online in
+  # the org and a service this script no longer recognises as its own.
+  [Alias('n')]
+  [int]    $Instances      = 1,
+  # Act on only this one instance. Without it, re-running to fix instance 3
+  # would tear down and re-register 1 and 2 as well -- three registration
+  # churns and three service restarts to fix one runner. Note that each
+  # instance registered prompts for the service account password separately.
+  [int]    $Instance       = 0,
   [string] $PythonVersion  = '3.12',
   [switch] $SkipToolchain,
   # Skip the registration step and stop after the toolchain. config.cmd prompts
@@ -140,10 +163,20 @@ $JobStartedHook = @'
   "Clean baseline" means the file's absence: nothing in provision.ps1 writes a
   .gitconfig for the service account, so that is what a freshly provisioned
   machine starts with.
+
+  GIT_CONFIG_GLOBAL is honoured because every instance on a multi-instance
+  machine runs as the SAME service account and so shares one $env:USERPROFILE.
+  Resetting the profile's .gitconfig would then delete the config out from
+  under a job already running on a sibling instance. provision.ps1 gives each
+  instance its own; unset falls back to the single-instance behaviour.
 #>
 $ErrorActionPreference = 'Continue'
 
-$gitconfig = Join-Path $env:USERPROFILE '.gitconfig'
+$gitconfig = if ($env:GIT_CONFIG_GLOBAL) {
+  $env:GIT_CONFIG_GLOBAL
+} else {
+  Join-Path $env:USERPROFILE '.gitconfig'
+}
 if (Test-Path $gitconfig) {
   Remove-Item -Force $gitconfig -ErrorAction SilentlyContinue
   Write-Host "hook: reset $gitconfig to a clean baseline"
@@ -185,6 +218,10 @@ $maxGb = if ($env:SWEEP_MAX_GB) { [int]$env:SWEEP_MAX_GB } else { 8 }
 # per-repository, so using it would enforce the budget once per repo rather
 # than once per machine -- on the Linux fleet that let each replica hold twice
 # its nominal budget with two repos checked out.
+# SWEEP_WORK_DIR is set per instance by provision.ps1 (in the service's own
+# environment), because this path is exactly what must NOT be shared: instance
+# 2 sweeping instance 1's _work would delete a target dir mid-build. The
+# literal below is only the single-instance default.
 $workDir = if ($env:SWEEP_WORK_DIR) { $env:SWEEP_WORK_DIR } else { 'C:\actions-runner\_work' }
 if (-not (Test-Path $workDir)) { exit 0 }
 
@@ -467,9 +504,78 @@ if (-not $Labels) {
   $Labels = if ($isArm) { 'windows,windows-arm64' } else { 'windows,windows-x64' }
 }
 
+if ($Instances -lt 1) { Fail "-Instances must be at least 1, got: $Instances" }
+if ($Instance -lt 0)  { Fail "-Instance must be a positive instance number, got: $Instance" }
+if ($Instance -gt $Instances) {
+  Fail "-Instance $Instance is outside 1..$Instances (pass -Instances $Instance or higher)"
+}
+
 if ($BuildJobs -le 0) {
   $cpus = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-  $BuildJobs = [Math]::Max(1, [Math]::Floor($cpus / 2))
+  # Half the cores, then divided again by the instance count: that half is the
+  # budget for RUNNER work as a whole, not per agent. N instances each sized
+  # for half the box would oversubscribe it by N -- and this VM shares its host
+  # with the OrbStack fleet, whose replicas drop with "lost communication" when
+  # it is starved. An explicit -BuildJobs is taken as given and NOT divided; it
+  # is already an answer to this question.
+  $BuildJobs = [Math]::Max(1, [Math]::Floor($cpus / 2 / $Instances))
+}
+
+# --------------------------------------------------------------------------
+# Per-instance derivation
+#
+# Instance 1 keeps every path and name this script used before -Instances
+# existed; see the -Instances parameter for why the numbering is offset rather
+# than uniform. Everything an instance must not share with its siblings is
+# derived here, in one place.
+# --------------------------------------------------------------------------
+
+function Get-InstanceSuffix { param([int] $Index) if ($Index -le 1) { '' } else { "-$Index" } }
+function Get-InstanceRoot   { param([int] $Index) "$RunnerRoot$(Get-InstanceSuffix $Index)" }
+function Get-InstanceName   { param([int] $Index) "$Name$(Get-InstanceSuffix $Index)" }
+
+# CARGO_HOME is the one that bites hardest. Two concurrent builds sharing a
+# cargo registry is not a tidiness problem, it is a build failure: the Linux
+# fleet gives every replica its own registry volume after sharing one produced
+#   error: could not compile `crc32fast` (lib)
+#   Caused by: No such file or directory (os error 2)
+# when another container's cargo garbage-collected unpacked sources mid-compile.
+# Every instance here runs as the SAME service account, so without this they
+# would share one registry under its profile.
+#
+# Instance 1 keeps the account's default ~/.cargo: it is already warm on every
+# provisioned machine, and moving it would re-download the index and every
+# crate for no isolation gain (it is isolated from 2..N either way).
+function Get-InstanceCargoHome {
+  param([int] $Index)
+  if ($Index -le 1) { $null } else { Join-Path (Get-InstanceRoot $Index) '.cargo' }
+}
+
+# The instances this run will act on.
+$instanceList = if ($Instance -ge 1) { @($Instance) } else { 1..$Instances }
+
+# The name of the Windows service backing a given instance.
+#
+# config.cmd writes the name it chose into `.service` in the runner root, and
+# that file is preferred over deriving the name here: it is what the runner
+# actually created, so it stays correct even if the naming scheme changes
+# under us, and it is how an instance whose name was changed by an earlier
+# provisioning run is still found. The derivation is only the fallback for a
+# root that has not been configured yet.
+function Get-RunnerServiceName {
+  param(
+    [Parameter(Mandatory)][string] $Root,
+    [Parameter(Mandatory)][string] $InstanceName
+  )
+  $marker = Join-Path $Root '.service'
+  if (Test-Path $marker) {
+    $recorded = (Get-Content -LiteralPath $marker -Raw -ErrorAction SilentlyContinue)
+    if ($recorded) {
+      $recorded = $recorded.Trim()
+      if ($recorded) { return $recorded }
+    }
+  }
+  "actions.runner.$($parts -join '-').$InstanceName"
 }
 
 # Derived here rather than at point of use so -DryRun can show it. Mirrors
@@ -484,12 +590,21 @@ $api = if ($parts.Count -ge 2) {
 }
 
 Info "Architecture   : $arch (runner package: $runnerArch)"
-Info "Runner name    : $Name"
 Info "Labels         : $Labels"
 Info "Service account: $ServiceAccount"
-Info "CARGO_BUILD_JOBS: $BuildJobs"
+Info "CARGO_BUILD_JOBS: $BuildJobs (per instance)"
 Info "Registration API: $api"
-Info "Runner root    : $RunnerRoot (actions-runner $RunnerVersion)"
+Info "Runner package : actions-runner $RunnerVersion"
+Info ("Instances      : $Instances" + $(if ($Instance -ge 1) { " (acting on #$Instance only)" } else { '' }))
+
+# The instance table is much of the point of -DryRun now: everything that must
+# differ between siblings is derived above, so printing it here is what makes a
+# derivation bug visible before it reaches a machine rather than after.
+foreach ($i in $instanceList) {
+  $ch = Get-InstanceCargoHome $i
+  if (-not $ch) { $ch = '<service account default>' }
+  Info "  #$i  name=$(Get-InstanceName $i)  root=$(Get-InstanceRoot $i)  CARGO_HOME=$ch"
+}
 
 if ($DryRun) {
   # The hooks go to TEMP rather than the runner root: it makes them
@@ -775,72 +890,215 @@ if (-not $SkipToolchain) {
   $wv = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
   if (-not $wv) { Warn 'WebView2 runtime not detected. The GUI will not launch; install it if this machine runs GUI jobs.' }
 }
-
 # --------------------------------------------------------------------------
-# Runner
+# Registration token
+#
+# Minted ONCE and reused by every instance. A registration token is not tied to
+# a runner -- it authorises registering against this org or repo for about an
+# hour -- so minting one per instance would mean N API calls, N chances to fail
+# partway through, and on the gh path potentially N interactive prompts, all to
+# obtain N interchangeable secrets.
 # --------------------------------------------------------------------------
 
-New-Item -ItemType Directory -Force -Path $RunnerRoot | Out-Null
-
-if (-not (Test-Path (Join-Path $RunnerRoot 'config.cmd'))) {
-  $pkg = Join-Path $tempDir "actions-runner-win-$runnerArch-$RunnerVersion.zip"
-  Get-File "https://github.com/actions/runner/releases/download/v$RunnerVersion/actions-runner-win-$runnerArch-$RunnerVersion.zip" $pkg
-  Info "Extracting runner to $RunnerRoot"
-  Expand-Archive -LiteralPath $pkg -DestinationPath $RunnerRoot -Force
+$token = $null
+if ($SkipRegistration) {
+  Warn 'SkipRegistration: installing the toolchain only, leaving the runner(s) unregistered.'
+} elseif ($RegistrationToken) {
+  Info 'Using the registration token supplied on the command line'
+  $token = $RegistrationToken
+} elseif ($Pat) {
+  Info 'Requesting a registration token with the supplied PAT'
+  try {
+    $resp = Invoke-RestMethod -Method Post -Uri $api -Headers @{
+      Authorization = "Bearer $Pat"
+      Accept        = 'application/vnd.github+json'
+    }
+  } catch {
+    Fail "Could not mint a registration token from $api -- check the PAT's scopes. $_"
+  }
+  $token = $resp.token
+} else {
+  # No PAT and no pre-minted token: let the GitHub CLI handle it, logging in or
+  # widening its scope interactively if it has to. This is the path an empty
+  # machine takes -- nothing to create beforehand, and gh's credential is
+  # managed and revocable rather than a classic PAT pasted through a shell.
+  if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Fail 'gh is not on PATH. Drop -SkipToolchain so this script installs it, or pass -Pat / -RegistrationToken.'
+  }
+  # An org runner needs admin:org; a repo runner needs admin on the repo, which
+  # the `repo` scope carries.
+  $ghScope = if ($parts.Count -ge 2) { 'repo' } else { 'admin:org' }
+  $token = Get-GhRegistrationToken -ApiPath ($api -replace '^https://api\.github\.com/', '') -Scope $ghScope
 }
 
-# The service account owns the runner tree. Without this the service starts and
-# then fails on its first write to _work, which surfaces as an opaque job
-# failure rather than a permissions error.
-Info "Granting $ServiceAccount full control of $RunnerRoot"
-$acl = Get-Acl $RunnerRoot
-$rule = New-Object Security.AccessControl.FileSystemAccessRule(
-  $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-$acl.SetAccessRule($rule)
-Set-Acl -Path $RunnerRoot -AclObject $acl
+# --------------------------------------------------------------------------
+# Per-instance environment
+#
+# The Linux entrypoint exports these before exec'ing run.sh, and macOS uses the
+# runner's own .env file. Neither is available to a Windows SERVICE, so this
+# splits the difference:
+#
+#   - Values identical on every instance stay in MACHINE environment, where
+#     they were before, and are set once below.
+#   - Values that MUST differ per instance go into that service's own
+#     `Environment` value (REG_MULTI_SZ) under its key in
+#     HKLM\SYSTEM\CurrentControlSet\Services. The Service Control Manager
+#     merges it into the environment of the process it launches. Machine
+#     environment cannot express these at all: it holds one value per name, so
+#     provisioning instance 2 would overwrite instance 1's hook paths and point
+#     both at one instance's hooks.
+#
+# Verified on the Windows 11 ARM VM before being relied on here: a service
+# created with a marker in its `Environment` value reported that marker back
+# from inside the launched process.
+# --------------------------------------------------------------------------
 
-if ($SkipRegistration) {
-  Warn 'SkipRegistration: installing the toolchain only, leaving the runner unregistered.'
-} else {
-  if ($RegistrationToken) {
-    Info 'Using the registration token supplied on the command line'
-    $token = $RegistrationToken
-  } elseif ($Pat) {
-    Info 'Requesting a registration token with the supplied PAT'
-    try {
-      $resp = Invoke-RestMethod -Method Post -Uri $api -Headers @{
-        Authorization = "Bearer $Pat"
-        Accept        = 'application/vnd.github+json'
-      }
-    } catch {
-      Fail "Could not mint a registration token from $api -- check the PAT's scopes. $_"
+function Set-ServiceEnvironment {
+  param(
+    [Parameter(Mandatory)][string] $ServiceName,
+    [Parameter(Mandatory)][hashtable] $Variables
+  )
+  $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+  if (-not (Test-Path $key)) { Fail "No registry key for service '$ServiceName' -- did config.cmd install it?" }
+  # Sorted so a re-provision produces a byte-identical value and the registry
+  # diff stays readable; hashtable order is otherwise arbitrary.
+  $entries = $Variables.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }
+  New-ItemProperty -Path $key -Name 'Environment' -PropertyType MultiString -Value $entries -Force | Out-Null
+  foreach ($e in $entries) { Info "  service env $e" }
+}
+
+# Applies one instance's private environment to its service and restarts it.
+# Shared by the registration path and the -SkipRegistration path so that a
+# machine provisioned either way ends up with the same service environment.
+$script:instancesEnvApplied = 0
+function Set-InstanceServiceEnvironment {
+  param(
+    [Parameter(Mandatory)][int]    $Index,
+    [Parameter(Mandatory)][string] $ServiceName,
+    [Parameter(Mandatory)][string] $Root,
+    [Parameter(Mandatory)][string] $HooksDir,
+    [AllowNull()][string] $CargoHome
+  )
+  $instEnv = @{
+    'ACTIONS_RUNNER_HOOK_JOB_STARTED'   = (Join-Path $HooksDir 'job-started-hook.sh')
+    'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' = (Join-Path $HooksDir 'job-completed-hook.sh')
+    # Names THIS instance's _work. Shared, one instance would sweep another's
+    # build tree mid-compile.
+    'SWEEP_WORK_DIR'                    = (Join-Path $Root '_work')
+    # Ditto git's global config: every instance runs as the same service
+    # account, and job-started-hook.ps1 resets this file before every job.
+    'GIT_CONFIG_GLOBAL'                 = (Join-Path $Root '.gitconfig')
+  }
+  # Instance 1 keeps the service account's default CARGO_HOME; see
+  # Get-InstanceCargoHome for why it is not moved.
+  if ($CargoHome) { $instEnv['CARGO_HOME'] = $CargoHome }
+
+  Info "Setting the service environment for $ServiceName"
+  Set-ServiceEnvironment -ServiceName $ServiceName -Variables $instEnv
+
+  Info "Restarting $ServiceName so it picks up its environment"
+  Restart-Service $ServiceName
+  Start-Sleep -Seconds 3
+  $svc = Get-Service $ServiceName
+  Info "Service status: $($svc.Status)"
+  if ($svc.Status -ne 'Running') {
+    Fail "Service $ServiceName is $($svc.Status). Check Event Viewer -> Windows Logs -> Application, and confirm the account password was correct."
+  }
+  $script:instancesEnvApplied++
+}
+
+# --------------------------------------------------------------------------
+# Provision-Instance
+#
+# Everything that belongs to ONE runner agent: its directory, its ACL, its
+# hooks, its registration, its service environment. The toolchain above is
+# shared and deliberately outside this -- Python, Git, rustup and the rest are
+# per machine, not per runner.
+# --------------------------------------------------------------------------
+
+function Provision-Instance {
+  param([Parameter(Mandatory)][int] $Index)
+
+  $instRoot  = Get-InstanceRoot $Index
+  $instName  = Get-InstanceName $Index
+  $instCargo = Get-InstanceCargoHome $Index
+
+  Info ''
+  Info "=== instance #$Index : $instName ($instRoot) ==="
+
+  New-Item -ItemType Directory -Force -Path $instRoot | Out-Null
+
+  if (-not (Test-Path (Join-Path $instRoot 'config.cmd'))) {
+    $pkg = Join-Path $tempDir "actions-runner-win-$runnerArch-$RunnerVersion.zip"
+    if (-not (Test-Path $pkg)) {
+      Get-File "https://github.com/actions/runner/releases/download/v$RunnerVersion/actions-runner-win-$runnerArch-$RunnerVersion.zip" $pkg
     }
-    $token = $resp.token
-  } else {
-    # No PAT and no pre-minted token: let the GitHub CLI handle it, logging in
-    # or widening its scope interactively if it has to. This is the path an
-    # empty machine takes -- nothing to create beforehand, and gh's credential
-    # is managed and revocable rather than a classic PAT pasted through a
-    # shell.
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-      Fail 'gh is not on PATH. Drop -SkipToolchain so this script installs it, or pass -Pat / -RegistrationToken.'
-    }
-    # An org runner needs admin:org; a repo runner needs admin on the repo,
-    # which the `repo` scope carries.
-    $ghScope = if ($parts.Count -ge 2) { 'repo' } else { 'admin:org' }
-    $token = Get-GhRegistrationToken -ApiPath ($api -replace '^https://api\.github\.com/', '') -Scope $ghScope
+    Info "Extracting runner to $instRoot"
+    Expand-Archive -LiteralPath $pkg -DestinationPath $instRoot -Force
   }
 
-  Push-Location $RunnerRoot
+  # The service account owns the runner tree. Without this the service starts
+  # and then fails on its first write to _work, which surfaces as an opaque job
+  # failure rather than a permissions error.
+  Info "Granting $ServiceAccount full control of $instRoot"
+  $acl  = Get-Acl $instRoot
+  $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+    $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+  $acl.SetAccessRule($rule)
+  Set-Acl -Path $instRoot -AclObject $acl
+
+  # Hooks live inside the instance root because the .sh wrapper hardcodes an
+  # absolute path to its .ps1 (see Write-HookFiles), so the pair cannot be
+  # shared between instances that need different paths.
+  $instHooks = Join-Path $instRoot 'hooks'
+  Write-HookFiles -Destination $instHooks | Out-Null
+
+  # Install this script beside the runner it provisions.
+  #
+  # Re-running is how a machine is upgraded, and the copy you first ran from is
+  # often somewhere temporary -- a Downloads folder, a network share, a
+  # checkout that gets deleted. Landing a copy at a stable, predictable path
+  # means the upgrade command is the same on every machine and does not depend
+  # on where the operator happened to be standing.
+  $selfSource = $PSCommandPath
+  $selfTarget = Join-Path $instRoot 'provision.ps1'
+  if ($selfSource -and (Test-Path $selfSource) -and
+      ((Resolve-Path $selfSource).Path -ne (Join-Path (Resolve-Path $instRoot).Path 'provision.ps1'))) {
+    Copy-Item -Force -LiteralPath $selfSource -Destination $selfTarget
+  }
+
+  if ($SkipRegistration) {
+    # Registration is skipped, but if this instance ALREADY has a service then
+    # its environment is still refreshed here. Without that, the machine-scope
+    # cleanup after the loop would strip the only hook paths a previously
+    # provisioned single-instance machine has, and its runner would silently
+    # stop resetting .gitconfig and sweeping _work.
+    $existingName = Get-RunnerServiceName $instRoot $instName
+    if (Get-Service -Name $existingName -ErrorAction SilentlyContinue) {
+      Set-InstanceServiceEnvironment -Index $Index -ServiceName $existingName -Root $instRoot -HooksDir $instHooks -CargoHome $instCargo
+    } else {
+      Info "Instance #$Index prepared at $instRoot; registration skipped."
+      $script:instancesEnvApplied++
+    }
+    return
+  }
+
+  Push-Location $instRoot
   try {
     # Remove any previous registration so re-running this script is an upgrade
     # rather than an error. `.runner_migrated` MUST be in this list: the runner
     # self-updates in place and drops that marker, and config.cmd treats the
     # marker ALONE as proof it is already configured. Leaving it behind is what
     # silently took the Linux fleet offline about ten days after a rebuild.
-    if (Get-Service 'actions.runner.*' -ErrorAction SilentlyContinue |
-          Where-Object { $_.Name -like "*$Name*" }) {
-      Info 'Removing the existing service registration'
+    #
+    # The service is matched on its EXACT name, not `-like "*$Name*"`. A
+    # substring test looks equivalent and is not: "win-BOX" is a substring of
+    # "win-BOX-2", so provisioning instance 1 would match a sibling's service
+    # and de-register a healthy runner.
+    $existing = Get-Service -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq (Get-RunnerServiceName $instRoot $instName) }
+    if ($existing) {
+      Info "Removing the existing service registration ($($existing.Name))"
       try { & .\config.cmd remove --token $token } catch { Warn "config.cmd remove failed: $_" }
     }
     foreach ($stale in '.runner','.credentials','.credentials_rsaparams','.runner_migrated','.credentials_migrated') {
@@ -849,7 +1107,7 @@ if ($SkipRegistration) {
       Remove-Item -Force -LiteralPath $stale -ErrorAction SilentlyContinue
     }
 
-    Info 'Configuring the runner as a Windows service'
+    Info "Configuring instance #$Index as a Windows service"
     Warn 'config.cmd will now prompt for the service account password. It goes straight into the runner and is not stored, logged, or passed on a command line.'
 
     # NOTE: deliberately NOT --unattended. Everything else is supplied, so the
@@ -857,10 +1115,14 @@ if ($SkipRegistration) {
     # want it entered. Passing --windowslogonpassword instead would put the
     # password in this process's command line, visible to any other process on
     # the machine for the lifetime of the call.
+    #
+    # With -Instances N this prompts N times, once per instance. That is the
+    # cost of keeping the password off every command line, and is preferred to
+    # the alternative.
     & .\config.cmd `
       --url $Url `
       --token $token `
-      --name $Name `
+      --name $instName `
       --labels $Labels `
       --work '_work' `
       --replace `
@@ -871,35 +1133,26 @@ if ($SkipRegistration) {
   } finally {
     Pop-Location
   }
+
+  # ------------------------------------------------------------------------
+  # This instance's service environment, then restart so it takes effect.
+  # ------------------------------------------------------------------------
+
+  $svcName = Get-RunnerServiceName $instRoot $instName
+  if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
+    Fail "No service '$svcName' found after configuring instance #$Index."
+  }
+  Set-InstanceServiceEnvironment -Index $Index -ServiceName $svcName -Root $instRoot -HooksDir $instHooks -CargoHome $instCargo
 }
 
 # --------------------------------------------------------------------------
 # Machine environment
 #
-# The Linux entrypoint exports these before exec'ing run.sh. A Windows service
-# has no equivalent hook, and the runner's `.env` file is read only by the
-# Linux systemd unit -- so machine-level environment is the portable place.
-# The service picks these up at start, which is why it is restarted below.
+# Only the values that are the SAME on every instance; everything per-instance
+# is set on the service itself, above. CARGO_BUILD_JOBS belongs here precisely
+# because it is already divided by the instance count, so every instance wants
+# the identical number.
 # --------------------------------------------------------------------------
-
-# Install this script beside the runner it provisions.
-#
-# Re-running is how a machine is upgraded, and the copy you first ran from is
-# often somewhere temporary -- a Downloads folder, a network share, a checkout
-# that gets deleted. Landing a copy at a stable, predictable path means the
-# upgrade command is the same on every machine and does not depend on where the
-# operator happened to be standing.
-$selfSource = $PSCommandPath
-$selfTarget = Join-Path $RunnerRoot 'provision.ps1'
-if ($selfSource -and (Test-Path $selfSource) -and
-    ((Resolve-Path $selfSource).Path -ne (Join-Path (Resolve-Path $RunnerRoot).Path 'provision.ps1'))) {
-  Copy-Item -Force -LiteralPath $selfSource -Destination $selfTarget
-  Info "Installed this script to $selfTarget"
-}
-
-$hooks = Join-Path $RunnerRoot 'hooks'
-New-Item -ItemType Directory -Force -Path $hooks | Out-Null
-Write-HookFiles -Destination $hooks | Out-Null
 
 $machineEnv = @{
   # Same reasoning as entrypoint.sh: without a cap, cargo sizes its thread pool
@@ -907,8 +1160,6 @@ $machineEnv = @{
   'CARGO_BUILD_JOBS'         = "$BuildJobs"
   'CARGO_INCREMENTAL'        = '0'
   'CARGO_PROFILE_DEV_DEBUG'  = 'line-tables-only'
-  'ACTIONS_RUNNER_HOOK_JOB_STARTED'   = (Join-Path $hooks 'job-started-hook.sh')
-  'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' = (Join-Path $hooks 'job-completed-hook.sh')
   'SWEEP_MAX_GB'             = '8'
 }
 foreach ($k in $machineEnv.Keys) {
@@ -916,24 +1167,40 @@ foreach ($k in $machineEnv.Keys) {
   Info "env $k = $($machineEnv[$k])"
 }
 
-$svc = Get-Service | Where-Object { $_.Name -like 'actions.runner.*' } | Select-Object -First 1
-if ($SkipRegistration) {
-  # Machine environment above may have changed even though registration was
-  # skipped -- a service already installed here would otherwise keep running
-  # with the old values until something else restarted it.
-  if ($svc) {
-    Info "Restarting $($svc.Name) so it picks up the machine environment"
-    Restart-Service $svc.Name
-    Start-Sleep -Seconds 3
-    Info "Service status: $((Get-Service $svc.Name).Status)"
+foreach ($i in $instanceList) { Provision-Instance -Index $i }
+
+# A previously provisioned machine has these in MACHINE scope, pointing at the
+# single instance that existed then. They are now per-service, so the leftovers
+# are dead weight that reads as authoritative -- and actively wrong on a
+# multi-instance machine, where a machine-scope SWEEP_WORK_DIR names one
+# instance's _work for all of them.
+#
+# Cleared only AFTER every instance this run touched has its own service
+# environment, and never when only some of them do. Clearing first, or clearing
+# on a partial run, would strip the only hook paths the remaining instances
+# have and leave them silently not resetting .gitconfig or sweeping _work --
+# which nothing reports, because a hook that is not configured is not an error.
+if ($script:instancesEnvApplied -eq @($instanceList).Count) {
+  foreach ($stale in 'ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED','SWEEP_WORK_DIR','GIT_CONFIG_GLOBAL','CARGO_HOME') {
+    if ([Environment]::GetEnvironmentVariable($stale, 'Machine')) {
+      [Environment]::SetEnvironmentVariable($stale, $null, 'Machine')
+      Info "cleared stale machine-scope $stale (now set per service)"
+    }
   }
+} elseif ([Environment]::GetEnvironmentVariable('ACTIONS_RUNNER_HOOK_JOB_STARTED', 'Machine')) {
+  Warn ("Machine-scope hook paths were left in place: $($script:instancesEnvApplied) of " +
+        "$(@($instanceList).Count) instances got their own service environment. " +
+        'Re-run without -Instance to clear them once every instance has one.')
+}
+
+if ($SkipRegistration) {
   Info ''
   Info 'Toolchain installed. To finish, run this from an ELEVATED PowerShell'
   Info 'on the machine itself -- config.cmd prompts for the account password on'
   Info 'an interactive console, which a remote or scripted session cannot answer:'
   Info ''
-  Info "    powershell -NoProfile -ExecutionPolicy Bypass -File $selfTarget ``"
-  Info "        -ServiceAccount '$ServiceAccount' -SkipToolchain"
+  Info "    powershell -NoProfile -ExecutionPolicy Bypass -File $(Join-Path (Get-InstanceRoot 1) 'provision.ps1') ``"
+  Info "        -ServiceAccount '$ServiceAccount' -Instances $Instances -SkipToolchain"
   Info ''
   Info 'The -ExecutionPolicy Bypass is not optional on a default Windows'
   Info 'install: RemoteSigned/Restricted refuses an unsigned .ps1 invoked by'
@@ -941,17 +1208,10 @@ if ($SkipRegistration) {
   Info ''
   exit 0
 }
-if ($svc) {
-  Info "Restarting $($svc.Name) so it picks up the machine environment"
-  Restart-Service $svc.Name
-  Start-Sleep -Seconds 3
-  $svc = Get-Service $svc.Name
-  Info "Service status: $($svc.Status)"
-  if ($svc.Status -ne 'Running') {
-    Fail "Service is $($svc.Status). Check Event Viewer -> Windows Logs -> Application, and confirm the account password was correct."
-  }
-} else {
-  Fail 'No actions.runner.* service found after configuration.'
-}
 
-Info 'Done. The runner should now appear under the org''s Actions > Runners.'
+Info ''
+if ($Instance -ge 1) {
+  Info "Done. Instance #$Instance should now appear under the org's Actions > Runners."
+} else {
+  Info "Done. $Instances runner(s) should now appear under the org's Actions > Runners."
+}

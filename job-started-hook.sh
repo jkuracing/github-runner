@@ -38,9 +38,23 @@
 # absence. This hook reproduces exactly that, every time, rather than trying
 # to selectively undo just the insteadOf rewrite (which would have to know
 # every key any consuming repo's setup snippet might someday add).
+#
+# Why GIT_CONFIG_GLOBAL and not just $HOME/.gitconfig
+# ---------------------------------------------------
+# On the Linux fleet one container holds one runner, so $HOME/.gitconfig is
+# private to it and deleting it can disturb nobody. That stops being true the
+# moment several runners share a machine, which is what provision.sh -n and
+# provision.ps1 -Instances now set up on macOS and Windows: every instance runs
+# as the same user, so a plain $HOME/.gitconfig is SHARED, and this hook firing
+# for instance 2 would delete the config out from under a job already running
+# on instance 1.
+#
+# Those provisioners therefore give each instance its own GIT_CONFIG_GLOBAL,
+# and this honours it. Unset -- the container case -- falls back to exactly the
+# previous behaviour, so nothing about the fleet changes.
 set -uo pipefail
 
-rm -f "${HOME:-/home/runner}/.gitconfig"
+rm -f "${GIT_CONFIG_GLOBAL:-${HOME:-/home/runner}/.gitconfig}"
 
 # Never fail the job. Like job-completed-hook.sh, this runs adjacent to work
 # that must not be put at risk by a cleanup step -- a non-zero exit here would
