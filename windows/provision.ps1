@@ -602,7 +602,10 @@ Info ("Instances      : $Instances" + $(if ($Instance -ge 1) { " (acting on #$In
 # derivation bug visible before it reaches a machine rather than after.
 foreach ($i in $instanceList) {
   $ch = Get-InstanceCargoHome $i
-  if (-not $ch) { $ch = '<service account default>' }
+  if (-not $ch) {
+    $inherited = [Environment]::GetEnvironmentVariable('CARGO_HOME', 'Machine')
+    $ch = if ($inherited) { "$inherited (inherited, machine scope)" } else { '<service account default>' }
+  }
   Info "  #$i  name=$(Get-InstanceName $i)  root=$(Get-InstanceRoot $i)  CARGO_HOME=$ch"
 }
 
@@ -1180,8 +1183,19 @@ foreach ($i in $instanceList) { Provision-Instance -Index $i }
 # on a partial run, would strip the only hook paths the remaining instances
 # have and leave them silently not resetting .gitconfig or sweeping _work --
 # which nothing reports, because a hook that is not configured is not an error.
+# CARGO_HOME is deliberately NOT in this list, and removing it from the list
+# was not a style choice -- clearing it broke a live machine. Instance 1 has no
+# per-service CARGO_HOME by design (see Get-InstanceCargoHome), so whatever is
+# in machine scope is exactly what it is supposed to inherit. On the ARM64 VM
+# that was `C:\rust\cargo`, sited out of the profile to match
+# `RUSTUP_HOME=C:\rust\rustup`, and clearing it silently repointed instance 1
+# at a cargo home that does not exist and holds none of its warm registry.
+#
+# The distinction is ownership, not naming: the two hook variables below are
+# ones THIS SCRIPT put in machine scope and has now moved per-service, so it
+# may clean them up. CARGO_HOME is site configuration that predates it.
 if ($script:instancesEnvApplied -eq @($instanceList).Count) {
-  foreach ($stale in 'ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED','SWEEP_WORK_DIR','GIT_CONFIG_GLOBAL','CARGO_HOME') {
+  foreach ($stale in 'ACTIONS_RUNNER_HOOK_JOB_STARTED','ACTIONS_RUNNER_HOOK_JOB_COMPLETED','SWEEP_WORK_DIR','GIT_CONFIG_GLOBAL') {
     if ([Environment]::GetEnvironmentVariable($stale, 'Machine')) {
       [Environment]::SetEnvironmentVariable($stale, $null, 'Machine')
       Info "cleared stale machine-scope $stale (now set per service)"
