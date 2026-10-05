@@ -69,6 +69,29 @@ x-runner: &runner
     # idle whenever hbf work is all that is queued. firmware_ci.yml asks for
     # [fw-builder]; hbf asks for [hbf-builder]; every replica can serve either.
     RUNNER_LABELS: ${RUNNER_LABELS:-fw-builder,hbf-builder}
+    # Lets rustup update the toolchain baked into the image. ~/.rustup lives on
+    # the container's overlay root, and overlayfs refuses to rename a directory
+    # that comes from a lower (image) layer, so once a stable release newer than
+    # the image's existed, `rustup toolchain install stable` failed on every
+    # replica. Rust 1.99.0 (2026-09-28) did this to every job running
+    # vs-website's publish-crates.yml "Install Rust" step from 2026-10-04:
+    #   error: could not rename 'component' file from '/home/runner/.rustup/
+    #     toolchains/stable-aarch64-unknown-linux-gnu/share/doc/cargo' to
+    #     '/home/runner/.rustup/tmp/<x>_dir/bk': Invalid cross-device link
+    #     (os error 18)
+    # With this set, rustup copies and deletes wherever a rename fails with
+    # EXDEV. Reproduced 2026-10-05 in fresh containers from the fleet image:
+    # without it the update fails as above, with it 1.98.1 updates to 1.99.0.
+    #
+    # rustup documents the variable as unstable and liable to be removed. If it
+    # ever is, this error returns with the next stable release; putting
+    # ~/.rustup on a volume, which is not overlay, would avoid it altogether.
+    #
+    # Set here rather than exported from entrypoint.sh like the cargo knobs
+    # below: an entrypoint export never reaches `docker exec`, and exec is how a
+    # replica's toolchain gets fixed by hand. Not in the Dockerfile either --
+    # rustup only runs there at build time, and the build does not hit this.
+    RUSTUP_PERMIT_COPY_RENAME: "1"
     # Match cargo's internal parallelism to this replica's CPU allotment.
     # cargo defaults to one codegen unit per *host* core, so without this each
     # replica would spawn ~16 threads and every replica would oversubscribe the
