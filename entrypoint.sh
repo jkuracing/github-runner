@@ -326,7 +326,11 @@ fi
 # The runner runs this hook between jobs, so unlike a host cron racing twelve
 # replicas it can never delete a target dir out from under a live compile.
 export ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/job-completed-hook.sh
-export SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
+export SWEEP_MAX_GB="${SWEEP_MAX_GB:-2}"
+# This container's /tmp is its own, so the hook may also clear the pytest and
+# cargo-install leftovers there. Set only here: see job-completed-hook.sh for
+# why the macOS instances, which share one /tmp, must leave it unset.
+export SWEEP_TMP_DIR=/tmp
 
 # Reset $HOME/.gitconfig before every job. Canvas-consuming repos' shared setup
 # snippet writes a git `insteadOf` rewrite with `git config --global set` (then
@@ -339,7 +343,7 @@ export SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
 export ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/job-started-hook.sh
 
 echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CARGO_PROFILE_DEV_DEBUG} RUSTC_WRAPPER=${RUSTC_WRAPPER:-<none>}"
-echo "Sweep: target/ budget ${SWEEP_MAX_GB} GB per replica, enforced after each job"
+echo "Sweep: target/ budget ${SWEEP_MAX_GB} GB per replica, plus ${SWEEP_TMP_DIR} leftovers, enforced after each job"
 echo "Gitconfig: reset to a clean baseline before each job (ACTIONS_RUNNER_HOOK_JOB_STARTED)"
 
 echo "Starting runner..."

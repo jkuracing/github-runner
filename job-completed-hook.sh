@@ -22,16 +22,18 @@
 #
 # Budget
 # ------
-# Total is meant to stay under 100 GB:
-#   images ~10 + cargo registries ~16 + sccache bucket <=20  = ~46 GB fixed
+# Total is meant to stay well under the OrbStack VM's 128 GB disk:
+#   images ~18 + cargo registries ~21 + sccache bucket ~8   = ~47 GB fixed
 #   12 replicas x SWEEP_MAX_GB                               = the rest
-# At the default of 4 GB that lands near 94 GB. Raising it trades disk for fewer
-# sweeps (and so faster jobs); lowering it does the reverse. Note this bounds
-# STEADY STATE, not the peak: a build in flight can exceed the threshold, and is
-# only swept once it finishes.
+# At the default of 2 GB that lands near 71 GB. It was 4 GB until 2026-10-19,
+# when the VM disk reached 97% with the rest of the budget taken up by the
+# toolchains and /tmp leftovers below. Raising it trades disk for fewer sweeps
+# (and so faster jobs); lowering it does the reverse. Note this bounds STEADY
+# STATE, not the peak: a build in flight can exceed the threshold, and is only
+# swept once it finishes.
 set -uo pipefail
 
-SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
+SWEEP_MAX_GB="${SWEEP_MAX_GB:-2}"
 # The runner root's _work, NOT $RUNNER_WORKSPACE.
 #
 # This originally read `${RUNNER_WORKSPACE:-/actions-runner/_work}`, which was
@@ -42,6 +44,26 @@ SWEEP_MAX_GB="${SWEEP_MAX_GB:-4}"
 # and the fleet total reached 52 GB against a 48 GB ceiling. SWEEP_WORK_DIR
 # stays overridable for testing.
 WORK_DIR="${SWEEP_WORK_DIR:-/actions-runner/_work}"
+
+# /tmp leftovers, outside _work and so outside the budget below. Done first,
+# because the budget check exits early whenever _work is within it. pytest keeps
+# its last three base temp dirs under pytest-of-<user>, and an interrupted
+# `cargo install` abandons its cargo-install* build dir. Measured 2026-10-19:
+# 0.4-1.4 GB per replica, ~5 GB across the fleet, on the writable layer.
+#
+# Off unless SWEEP_TMP_DIR is set, and only entrypoint.sh sets it. A container
+# has a /tmp of its own and this hook runs between jobs, so nothing there is in
+# use. The macOS instances (macos/provision.sh) reuse this hook but share one
+# user and one /tmp, so there it would delete a sibling instance's live pytest
+# or cargo install.
+if [[ -n "${SWEEP_TMP_DIR:-}" && -d "$SWEEP_TMP_DIR" ]]; then
+  for dir in "$SWEEP_TMP_DIR"/pytest-of-* "$SWEEP_TMP_DIR"/cargo-install*; do
+    [[ -d "$dir" ]] || continue
+    freed=$(du -sm "$dir" 2>/dev/null | cut -f1)
+    rm -rf "$dir" && echo "sweep: removed ${dir} (${freed:-?} MB)"
+  done
+fi
+
 # _work holds more than checkouts (_tool, _temp, _actions), so measure the whole
 # thing -- that is what actually occupies the writable layer.
 [[ -d "$WORK_DIR" ]] || exit 0

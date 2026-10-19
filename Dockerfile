@@ -232,6 +232,45 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
     rm -rf /tmp/sccache.tar.gz "/tmp/${SCCACHE_PKG}" && \
     sccache --version
 
+# ============================================================================
+# Toolchains the jobs install for themselves
+# ============================================================================
+# Every toolchain a job installs or updates lands on that replica's writable
+# layer, so it is paid for once PER REPLICA instead of once in the shared image.
+# Measured 2026-10-19 with the VM disk at 97%: ~/.rustup on the writable layers
+# held ~42 GB across the twelve aarch64 replicas, 2.5-4 GB each -- more than
+# every replica's _work combined. Two sources:
+#
+#   - `stable`, which dtolnay/rust-toolchain@stable (canvas, bender-driver,
+#     firmware, hbf) and `rustup toolchain install stable` (vs-website) both
+#     update. The layer near the top of this file pins whatever stable was on
+#     the day it was cached, so after each Rust release every replica rewrote
+#     the whole toolchain into its own layer (~1.4 GB each).
+#   - `1.99.0`, from probe-rs's rust-toolchain.toml, which `rustup toolchain
+#     install` in jkuracing-ci.yml installs from scratch (~1.5 GB each).
+#
+# Installing both here puts them in the image, where all replicas share one
+# copy. This only DELAYS the stable half: the next stable release puts a copy
+# back on every replica, so rebuild the image after each Rust release (every six
+# weeks) and bump RUST_PINNED_TOOLCHAINS whenever probe-rs's pin moves.
+#
+# Profile and components mirror what the jobs ask for. rustup does not reinstall
+# a toolchain that is already present, it only adds the missing components and
+# targets, so a job asking for more than this costs only the difference.
+#
+# Placed after the espup and sccache layers, so a bump here never rebuilds the
+# Xtensa toolchain, and before `COPY entrypoint.sh`, so entrypoint edits do not
+# re-download it. RUSTUP_HOME is still /usr/local/rustup at this point; the
+# runner-user layer below copies it to /home/runner/.rustup.
+ARG RUST_PINNED_TOOLCHAINS="1.99.0"
+RUN rustup toolchain install stable --profile minimal --component rustfmt,clippy && \
+    for tc in $RUST_PINNED_TOOLCHAINS; do \
+      rustup toolchain install "$tc" --profile minimal \
+        --component rustfmt,clippy --target thumbv7m-none-eabi; \
+    done && \
+    rustup default stable && \
+    rustup toolchain list
+
 # Copy entrypoint script, the post-job sweep hook, and the pre-job gitconfig
 # reset hook
 COPY entrypoint.sh /entrypoint.sh
