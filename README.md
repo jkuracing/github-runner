@@ -141,10 +141,10 @@ Between jobs, `job-completed-hook.sh` keeps each replica's `_work` under
 clears pytest and `cargo install` leftovers from `/tmp`.
 
 Toolchains a job installs land on that replica's writable layer, once per
-replica. To keep them in the shared image instead, rebuild after each Rust
-stable release, and bump `RUST_PINNED_TOOLCHAINS` in the `Dockerfile` when
-probe-rs's `rust-toolchain.toml` changes. Before this, the twelve replicas
-held ~42 GB of private toolchain copies.
+replica. To keep them in the shared image instead, run `./update.sh` after
+each Rust stable release (see below), and bump `RUST_PINNED_TOOLCHAINS` in the
+`Dockerfile` when probe-rs's `rust-toolchain.toml` changes. Before this, the
+twelve replicas held ~42 GB of private toolchain copies.
 
 ### Running with Docker Compose
 
@@ -160,6 +160,24 @@ docker compose up -d --build
 > Always pass `--build`. Plain `docker compose up -d` only builds when the image
 > is missing, so it will happily keep running a stale image after the Dockerfile
 > or `entrypoint.sh` changes.
+
+### Updating after a Rust release
+
+```bash
+./update.sh --check   # is a rebuild due?
+./update.sh           # rebuild if Rust stable changed, then prune old images
+./update.sh --force   # rebuild anyway, e.g. after a Dockerfile change
+```
+
+Rust ships a stable release every six weeks, plus point releases in between.
+`update.sh` compares the current stable with the version the image was built
+with, and stops if they match. Otherwise it runs `start.sh`, which rebuilds
+the image and recreates the containers, and then deletes the images the
+rebuild replaced (`docker image prune -f`, about 15 GB per rebuild).
+
+`start.sh` passes the current stable version into the build as
+`RUST_STABLE_VERSION`. Without it, Docker reuses the cached toolchain layer and
+the rebuild keeps the old stable.
 
 ## x86_64 runners on an Apple Silicon host
 

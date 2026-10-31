@@ -36,6 +36,21 @@ env_has() { grep -qE "^[[:space:]]*(export[[:space:]]+)?$1=" .env; }
 env_has URL        || die ".env sets no URL (looked for 'URL=' or 'export URL=')."
 env_has GITHUB_PAT || die ".env sets no GITHUB_PAT (a runner cannot register without it)"
 
+# The Dockerfile's toolchain layer is keyed on this, so a rebuild installs the
+# current stable instead of reusing the cached one (see the Dockerfile). Kept if
+# the caller already set it, as update.sh does. If the channel cannot be read,
+# the build goes ahead with it empty: that misses this layer's cache once, it
+# does not fail the build.
+if [ -z "${RUST_STABLE_VERSION:-}" ]; then
+  RUST_STABLE_VERSION=$(./rust-stable-version.sh 2>/dev/null || true)
+fi
+export RUST_STABLE_VERSION
+if [ -n "$RUST_STABLE_VERSION" ]; then
+  say "Rust stable for the image: $RUST_STABLE_VERSION"
+else
+  printf '\033[33m!!  could not read the Rust stable version; building without it.\033[0m\n'
+fi
+
 # A plain string, not an array: macOS ships bash 3.2, where `mapfile` does not
 # exist at all and `${arr[@]}` on an empty array trips `set -u`. Service names
 # never contain spaces, so word splitting is safe here.
