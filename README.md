@@ -10,7 +10,9 @@ This runner includes all tools required for the firmware CI pipeline:
 
 ### Rust Development
 
-- **Rust stable toolchain** with `rustfmt` and `clippy`
+- **Rust stable toolchain** with `rustfmt` and `clippy`, plus the pinned
+  toolchains in `RUST_PINNED_TOOLCHAINS` (probe-rs's `1.99.0`, with the
+  `thumbv7m-none-eabi` target)
 - **ESP-IDF Xtensa toolchain** for ESP32-S3 development (`espup`)
 - **cargo-nextest** for fast test execution
 
@@ -133,6 +135,16 @@ submodule `target/` surviving `git submodule deinit` is what produced
 `could not parse/generate dep info ... No such file or directory` build
 failures. sccache is content-hashed and immune to that staleness, so it is the
 right layer to persist; `_work` is not.
+
+Between jobs, `job-completed-hook.sh` keeps each replica's `_work` under
+`SWEEP_MAX_GB` (2 GB by default) by deleting the largest `target/` dirs, and
+clears pytest and `cargo install` leftovers from `/tmp`.
+
+Toolchains a job installs land on that replica's writable layer, once per
+replica. To keep them in the shared image instead, rebuild after each Rust
+stable release, and bump `RUST_PINNED_TOOLCHAINS` in the `Dockerfile` when
+probe-rs's `rust-toolchain.toml` changes. Before this, the twelve replicas
+held ~42 GB of private toolchain copies.
 
 ### Running with Docker Compose
 
