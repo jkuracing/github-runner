@@ -160,6 +160,11 @@ docker compose up -d --build
 > Always pass `--build`. Plain `docker compose up -d` only builds when the image
 > is missing, so it will happily keep running a stale image after the Dockerfile
 > or `entrypoint.sh` changes.
+>
+> Prefer `./start.sh` over calling compose directly. It passes
+> `RUST_STABLE_VERSION`, and a bare `docker compose build` leaves it empty,
+> which rebuilds the toolchain layer and leaves an image `update.sh` reports as
+> out of date.
 
 ### Updating after a Rust release
 
@@ -173,7 +178,8 @@ Rust ships a stable release every six weeks, plus point releases in between.
 `update.sh` compares the current stable with the version the image was built
 with, and stops if they match. Otherwise it runs `start.sh`, which rebuilds
 the image and recreates the containers, and then deletes the images the
-rebuild replaced (`docker image prune -f`, about 15 GB per rebuild).
+rebuild replaced and the build cache behind them (`docker image prune -f` and
+`docker builder prune -f`, about 12-15 GB per rebuild).
 
 `start.sh` passes the current stable version into the build as
 `RUST_STABLE_VERSION`. Without it, Docker reuses the cached toolchain layer and

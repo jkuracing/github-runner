@@ -87,9 +87,13 @@ docker compose ps --format 'table {{.Name}}\t{{.Status}}' | head -20
 # A container that is Up but failed to register is the failure mode this script
 # exists to make visible: it looks healthy and silently never takes a job.
 say "Registration check (last line per runner)"
+#
+# `|| true` because a runner that has printed nothing yet makes grep exit 1,
+# and under `set -euo pipefail` that ended the whole script right here -- so
+# update.sh never reached its prune step -- instead of printing the fallback.
 for s in $services; do
   line=$(docker compose logs --tail 40 "$s" 2>/dev/null \
-         | grep -iE "Listening for Jobs|Runner successfully|error|failed" | tail -1)
+         | grep -iE "Listening for Jobs|Runner successfully|error|failed" | tail -1 || true)
   printf '  %-20s %s\n' "$s" "${line:-<no runner output yet>}"
 done
 

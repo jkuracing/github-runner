@@ -13,7 +13,10 @@
 # A rebuild leaves the previous images behind untagged -- ~15.5 GB on
 # 2026-10-19, measured after the rebuild that introduced the toolchain layer.
 # Nothing refers to them once the containers are recreated, so they are pruned
-# here rather than left for someone to notice the disk filling.
+# here rather than left for someone to notice the disk filling. Pruning the
+# images alone frees nothing while BuildKit's cache still holds their layers:
+# the first run of this script deleted 14 images for 0 B, and the build cache
+# prune after it freed 12.45 GB. So both are pruned.
 #
 # What it does
 # ------------
@@ -22,7 +25,9 @@
 #   2. runs start.sh, which builds, recreates the containers and checks
 #      that every runner registers
 #   3. `docker image prune -f`, which deletes every untagged image on this
-#      Docker host, not only the runners'
+#      Docker host, not only the runners', then `docker builder prune -f`,
+#      which deletes the build cache no image uses any more. The cache behind
+#      the current images stays, so the next rebuild is still incremental.
 #
 # Recreating a container drops its _work, so the next build of each repo per
 # replica starts without a target/ dir. sccache keeps that fast.
@@ -68,8 +73,9 @@ fi
 
 RUST_STABLE_VERSION="$latest" ./start.sh
 
-say "Deleting the images this rebuild replaced"
+say "Deleting the images this rebuild replaced, and their build cache"
 docker image prune -f
+docker builder prune -f
 
 say "Disk now"
 docker system df
