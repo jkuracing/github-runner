@@ -252,7 +252,14 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # Installing both here puts them in the image, where all replicas share one
 # copy. This only DELAYS the stable half: the next stable release puts a copy
 # back on every replica, so rebuild the image after each Rust release (every six
-# weeks) and bump RUST_PINNED_TOOLCHAINS whenever probe-rs's pin moves.
+# weeks; ./update.sh checks and does it) and bump RUST_PINNED_TOOLCHAINS
+# whenever probe-rs's pin moves.
+#
+# RUST_STABLE_VERSION is what makes that rebuild pick up the new stable. Docker
+# caches this layer by its command, which never changes, so without it a rebuild
+# reuses the cached layer and the stable it already had. start.sh passes the
+# current stable version, read from Rust's release channel, so the layer is
+# rebuilt exactly when that version moves. The label records it for update.sh.
 #
 # Profile and components mirror what the jobs ask for. rustup does not reinstall
 # a toolchain that is already present, it only adds the missing components and
@@ -263,13 +270,16 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # re-download it. RUSTUP_HOME is still /usr/local/rustup at this point; the
 # runner-user layer below copies it to /home/runner/.rustup.
 ARG RUST_PINNED_TOOLCHAINS="1.99.0"
-RUN rustup toolchain install stable --profile minimal --component rustfmt,clippy && \
+ARG RUST_STABLE_VERSION=""
+RUN echo "stable: ${RUST_STABLE_VERSION:-unknown}" && \
+    rustup toolchain install stable --profile minimal --component rustfmt,clippy && \
     for tc in $RUST_PINNED_TOOLCHAINS; do \
       rustup toolchain install "$tc" --profile minimal \
         --component rustfmt,clippy --target thumbv7m-none-eabi; \
     done && \
     rustup default stable && \
     rustup toolchain list
+LABEL org.jkuracing.rust-stable="${RUST_STABLE_VERSION}"
 
 # Copy entrypoint script, the post-job sweep hook, and the pre-job gitconfig
 # reset hook

@@ -34,7 +34,13 @@
 # they still start and register, so nothing looks wrong until a job needs a tool
 # only the rebuilt image has.
 x-runner: &runner
-  build: .
+  # RUST_STABLE_VERSION is filled in by start.sh; see the Dockerfile's toolchain
+  # layer for why. The amd64 services restate it because their `build:` mapping
+  # replaces this one wholesale.
+  build:
+    context: .
+    args:
+      RUST_STABLE_VERSION: ${RUST_STABLE_VERSION:-}
   # `on-failure:5` used to be the policy here and it cost the fleet ten days of
   # downtime: a bug in entrypoint.sh's config cleanup made every replica exit 1
   # on restart, the five retries were spent in seconds, and Docker then left all
@@ -303,6 +309,7 @@ services:
       context: .
       args:
         INSTALL_ESP: "0"
+        RUST_STABLE_VERSION: ${RUST_STABLE_VERSION:-}
     environment:
       <<: *runner-env
       # hbf-builder-amd64 ONLY. Without the ESP toolchain this container cannot
@@ -321,6 +328,7 @@ services:
       context: .
       args:
         INSTALL_ESP: "0"
+        RUST_STABLE_VERSION: ${RUST_STABLE_VERSION:-}
     environment:
       <<: *runner-env
       # hbf-builder-amd64 ONLY. Without the ESP toolchain this container cannot
