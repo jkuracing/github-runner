@@ -76,7 +76,28 @@ param(
   [string] $ServiceAccount,
   [string] $Name           = "win-$env:COMPUTERNAME",
   [string] $Labels         = '',
-  [string] $RunnerRoot     = 'C:\actions-runner',
+  # Where the runner itself is installed: its binaries, its registration, its
+  # _diag logs, and the RunnerService.exe its Windows service points at.
+  #
+  # Under Program Files because that is the only place a Windows feature
+  # upgrade reliably carries a third-party service across. An in-place upgrade
+  # (every Insider build is one) rebuilds the service table from a migration
+  # pass, and that pass dropped all three runner services at
+  # C:\actions-runner*, on two separate upgrades, with
+  #   CAddSystemServicesExpander::ExtractImagePath: Failed to extract file
+  #   path from actions.runner...::ImagePath=["C:\actions-runner\bin\..."]
+  # in C:\Windows\Panther\setupact.log -- while every third-party service it
+  # kept (Parallels Tools, Bonjour, SolidWorks Licensing, Visual Studio) lives
+  # under Program Files. The files, the registration and the `ci` account all
+  # survived; only the services went, so nothing started on the next boot and
+  # GitHub saw the runners go offline.
+  [string] $RunnerRoot     = (Join-Path $env:ProgramFiles 'actions-runner'),
+  # Where each instance's working data lives: _work, its hooks, its .cargo and
+  # .gitconfig. Deliberately NOT under $RunnerRoot. Build trees under a path
+  # with a space ("Program Files") break more build scripts than they should,
+  # and keeping this at the old location means a machine moved from the old
+  # layout keeps its warm _work and cargo registries.
+  [string] $DataRoot       = 'C:\actions-runner',
   # Empty means "resolve the latest release at run time", which is what every
   # other download here does. A hand-pinned version only goes stale: the runner
   # self-updates on first contact with GitHub anyway, so pinning buys nothing
@@ -95,7 +116,7 @@ param(
   # serialises every PR that needs Windows.
   #
   # Instance 1 is deliberately IDENTICAL to what this script produced before
-  # -Instances existed: same C:\actions-runner, same name, same service.
+  # -Instances existed: same root naming, same name, same service.
   # Instances 2..N are siblings with a -2, -3 suffix. Numbering them all
   # -1..-N would have been tidier, but it would rename the runner on every
   # machine already provisioned, leaving an orphaned registration online in
@@ -567,7 +588,24 @@ if ($BuildJobs -le 0) {
 
 function Get-InstanceSuffix { param([int] $Index) if ($Index -le 1) { '' } else { "-$Index" } }
 function Get-InstanceRoot   { param([int] $Index) "$RunnerRoot$(Get-InstanceSuffix $Index)" }
+function Get-InstanceDataRoot { param([int] $Index) "$DataRoot$(Get-InstanceSuffix $Index)" }
 function Get-InstanceName   { param([int] $Index) "$Name$(Get-InstanceSuffix $Index)" }
+
+# What an earlier version of this script installed into the data root, when
+# the runner lived there too. Removed once the instance is registered from
+# $RunnerRoot, so a stale config.cmd or provision.ps1 cannot be run by mistake.
+# Everything NOT listed -- _work, hooks, .cargo, .gitconfig, _diag -- stays.
+$legacyInstallItems = @(
+  'bin', 'externals', 'config.cmd', 'run.cmd', 'run-helper.cmd.template',
+  'run-helper.sh.template', 'safe_sleep.sh', 'provision.ps1',
+  '.runner', '.credentials', '.credentials_rsaparams', '.runner_migrated',
+  '.credentials_migrated', '.service', '.env', '.path', '.setup_info'
+)
+function Test-LegacyInstall {
+  param([int] $Index)
+  $d = Get-InstanceDataRoot $Index
+  ($d -ne (Get-InstanceRoot $Index)) -and (Test-Path (Join-Path $d 'config.cmd'))
+}
 
 # CARGO_HOME is the one that bites hardest. Two concurrent builds sharing a
 # cargo registry is not a tidiness problem, it is a build failure: the Linux
@@ -583,7 +621,7 @@ function Get-InstanceName   { param([int] $Index) "$Name$(Get-InstanceSuffix $In
 # crate for no isolation gain (it is isolated from 2..N either way).
 function Get-InstanceCargoHome {
   param([int] $Index)
-  if ($Index -le 1) { $null } else { Join-Path (Get-InstanceRoot $Index) '.cargo' }
+  if ($Index -le 1) { $null } else { Join-Path (Get-InstanceDataRoot $Index) '.cargo' }
 }
 
 # The instances this run will act on.
@@ -611,6 +649,18 @@ function Get-RunnerServiceName {
     }
   }
   "actions.runner.$($parts -join '-').$InstanceName"
+}
+
+# The service name for an instance, looking in its install root first and in
+# its data root second: a machine provisioned before the install moved to
+# Program Files still has its `.service` marker there.
+function Get-InstanceServiceName {
+  param([Parameter(Mandatory)][int] $Index)
+  $inst = Get-InstanceRoot $Index
+  if ((-not (Test-Path (Join-Path $inst '.service'))) -and (Test-LegacyInstall $Index)) {
+    return Get-RunnerServiceName (Get-InstanceDataRoot $Index) (Get-InstanceName $Index)
+  }
+  Get-RunnerServiceName $inst (Get-InstanceName $Index)
 }
 
 # Derived here rather than at point of use so -DryRun can show it. Mirrors
@@ -641,7 +691,8 @@ foreach ($i in $instanceList) {
     $inherited = [Environment]::GetEnvironmentVariable('CARGO_HOME', 'Machine')
     $ch = if ($inherited) { "$inherited (inherited, machine scope)" } else { '<service account default>' }
   }
-  Info "  #$i  name=$(Get-InstanceName $i)  root=$(Get-InstanceRoot $i)  CARGO_HOME=$ch"
+  $legacy = if (Test-LegacyInstall $i) { '  (legacy install in data root: moved)' } else { '' }
+  Info "  #$i  name=$(Get-InstanceName $i)  root=$(Get-InstanceRoot $i)  data=$(Get-InstanceDataRoot $i)  CARGO_HOME=$ch$legacy"
 }
 
 if ($DryRun) {
@@ -1058,13 +1109,17 @@ function Provision-Instance {
   param([Parameter(Mandatory)][int] $Index)
 
   $instRoot  = Get-InstanceRoot $Index
+  $instData  = Get-InstanceDataRoot $Index
   $instName  = Get-InstanceName $Index
   $instCargo = Get-InstanceCargoHome $Index
+  $legacy    = Test-LegacyInstall $Index
 
   Info ''
-  Info "=== instance #$Index : $instName ($instRoot) ==="
+  Info "=== instance #$Index : $instName ($instRoot, data $instData) ==="
+  if ($legacy) { Info "Found an earlier install in $instData; it moves to $instRoot." }
 
   New-Item -ItemType Directory -Force -Path $instRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $instData | Out-Null
 
   if (-not (Test-Path (Join-Path $instRoot 'config.cmd'))) {
     $pkg = Join-Path $tempDir "actions-runner-win-$runnerArch-$RunnerVersion.zip"
@@ -1078,17 +1133,24 @@ function Provision-Instance {
   # The service account owns the runner tree. Without this the service starts
   # and then fails on its first write to _work, which surfaces as an opaque job
   # failure rather than a permissions error.
-  Info "Granting $ServiceAccount full control of $instRoot"
-  $acl  = Get-Acl $instRoot
-  $rule = New-Object Security.AccessControl.FileSystemAccessRule(
-    $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-  $acl.SetAccessRule($rule)
-  Set-Acl -Path $instRoot -AclObject $acl
+  # The install root needs it too, not just the data root: the runner
+  # self-updates in place, writes _diag there, and Program Files grants
+  # ordinary accounts read-only by default.
+  foreach ($r in @($instRoot, $instData)) {
+    Info "Granting $ServiceAccount full control of $r"
+    $acl  = Get-Acl $r
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+      $aclIdentity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.SetAccessRule($rule)
+    Set-Acl -Path $r -AclObject $acl
+  }
 
-  # Hooks live inside the instance root because the .sh wrapper hardcodes an
-  # absolute path to its .ps1 (see Write-HookFiles), so the pair cannot be
-  # shared between instances that need different paths.
-  $instHooks = Join-Path $instRoot 'hooks'
+  # Hooks live inside the instance's data root because the .sh wrapper
+  # hardcodes an absolute path to its .ps1 (see Write-HookFiles), so the pair
+  # cannot be shared between instances that need different paths. The data
+  # root rather than the install root because that path is quoted inside a
+  # shell script, and it has no space in it.
+  $instHooks = Join-Path $instData 'hooks'
   Write-HookFiles -Destination $instHooks | Out-Null
 
   # Install this script beside the runner it provisions.
@@ -1111,14 +1173,25 @@ function Provision-Instance {
     # cleanup after the loop would strip the only hook paths a previously
     # provisioned single-instance machine has, and its runner would silently
     # stop resetting .gitconfig and sweeping _work.
-    $existingName = Get-RunnerServiceName $instRoot $instName
+    $existingName = Get-InstanceServiceName $Index
     if (Get-Service -Name $existingName -ErrorAction SilentlyContinue) {
-      Set-InstanceServiceEnvironment -Index $Index -ServiceName $existingName -Root $instRoot -HooksDir $instHooks -CargoHome $instCargo
+      Set-InstanceServiceEnvironment -Index $Index -ServiceName $existingName -Root $instData -HooksDir $instHooks -CargoHome $instCargo
     } else {
       Info "Instance #$Index prepared at $instRoot; registration skipped."
       $script:instancesEnvApplied++
     }
     return
+  }
+
+  # A legacy service still pointing into the data root is unregistered from
+  # THERE, with the config.cmd that installed it. Leaving it would keep a
+  # second service with the same name, which the new config.cmd cannot create.
+  $existingName = Get-InstanceServiceName $Index
+  if ($legacy -and (Get-Service -Name $existingName -ErrorAction SilentlyContinue)) {
+    Info "Removing the earlier service registration from $instData ($existingName)"
+    Push-Location $instData
+    try { & .\config.cmd remove --token $token } catch { Warn "config.cmd remove failed: $_" }
+    finally { Pop-Location }
   }
 
   Push-Location $instRoot
@@ -1162,7 +1235,7 @@ function Provision-Instance {
       --token $token `
       --name $instName `
       --labels $Labels `
-      --work '_work' `
+      --work (Join-Path $instData '_work') `
       --replace `
       --runasservice `
       --windowslogonaccount $ServiceAccount
@@ -1180,7 +1253,20 @@ function Provision-Instance {
   if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
     Fail "No service '$svcName' found after configuring instance #$Index."
   }
-  Set-InstanceServiceEnvironment -Index $Index -ServiceName $svcName -Root $instRoot -HooksDir $instHooks -CargoHome $instCargo
+  Set-InstanceServiceEnvironment -Index $Index -ServiceName $svcName -Root $instData -HooksDir $instHooks -CargoHome $instCargo
+
+  # Only now, with the new service running, is the old install dead weight.
+  if ($legacy) {
+    Info "Removing the earlier runner install from $instData (_work, hooks, .cargo and _diag stay)"
+    foreach ($item in $legacyInstallItems) {
+      $p = Join-Path $instData $item
+      if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p -ErrorAction SilentlyContinue }
+    }
+    # Self-updates leave versioned siblings: bin.2.330.0, externals.2.330.0.
+    Get-ChildItem -LiteralPath $instData -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '^(bin|externals)\.\d' } |
+      ForEach-Object { Remove-Item -Recurse -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
+  }
 }
 
 # --------------------------------------------------------------------------
@@ -1253,7 +1339,7 @@ if ($SkipRegistration) {
   Info 'on the machine itself -- config.cmd prompts for the account password on'
   Info 'an interactive console, which a remote or scripted session cannot answer:'
   Info ''
-  Info "    powershell -NoProfile -ExecutionPolicy Bypass -File $(Join-Path (Get-InstanceRoot 1) 'provision.ps1') ``"
+  Info "    powershell -NoProfile -ExecutionPolicy Bypass -File '$(Join-Path (Get-InstanceRoot 1) 'provision.ps1')' ``"
   Info "        -ServiceAccount '$ServiceAccount' -Instances $Instances -SkipToolchain"
   Info ''
   Info 'The -ExecutionPolicy Bypass is not optional on a default Windows'
