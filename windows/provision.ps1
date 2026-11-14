@@ -532,11 +532,32 @@ manual rights assignment is needed.
   Warn 'config.cmd will ask for this password again shortly. That second prompt is deliberate: it keeps the password inside the runner rather than on a command line.'
 }
 
+# The fallback reads the tag from github.com's /releases/latest redirect, which
+# is a web page, not the REST API, so it is not subject to the API's 60
+# requests/hour limit for unauthenticated callers. That limit is per public IP,
+# and a machine on a university network shares its IP with everyone else
+# there: it ran out on the first re-provision attempt that needed it.
+function Get-LatestRunnerVersionFromRedirect {
+  $req = [Net.HttpWebRequest]::Create('https://github.com/actions/runner/releases/latest')
+  $req.Method = 'HEAD'
+  $req.AllowAutoRedirect = $false
+  $resp = $req.GetResponse()
+  try { $loc = $resp.Headers['Location'] } finally { $resp.Close() }
+  if ($loc -notmatch '/tag/v?([0-9][^/]*)$') { throw "unexpected redirect target '$loc'" }
+  $Matches[1]
+}
+
 if (-not $RunnerVersion) {
   try {
     $RunnerVersion = (Invoke-RestMethod 'https://api.github.com/repos/actions/runner/releases/latest').tag_name -replace '^v', ''
   } catch {
-    Fail "Could not resolve the latest actions/runner release: $_. Pass -RunnerVersion to pin one."
+    $apiError = $_
+    try {
+      $RunnerVersion = Get-LatestRunnerVersionFromRedirect
+      Warn "The GitHub API refused the release lookup ($($apiError.Exception.Message)); read $RunnerVersion from the releases page instead."
+    } catch {
+      Fail "Could not resolve the latest actions/runner release: API: $apiError; releases page: $_. Pass -RunnerVersion to pin one."
+    }
   }
 }
 
@@ -1223,7 +1244,9 @@ function Provision-Instance {
 
     # NOTE: deliberately NOT --unattended. Everything else is supplied, so the
     # only thing it can prompt for is the password -- which is exactly where we
-    # want it entered. Passing --windowslogonpassword instead would put the
+    # want it entered. "Everything" includes --runnergroup: for an org runner,
+    # config.cmd otherwise asks for the group first, and a prompt nobody
+    # expects reads as a hang. Passing --windowslogonpassword instead would put the
     # password in this process's command line, visible to any other process on
     # the machine for the lifetime of the call.
     #
@@ -1234,6 +1257,7 @@ function Provision-Instance {
       --url $Url `
       --token $token `
       --name $instName `
+      --runnergroup 'Default' `
       --labels $Labels `
       --work (Join-Path $instData '_work') `
       --replace `
