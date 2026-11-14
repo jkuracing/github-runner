@@ -540,7 +540,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
     -ServiceAccount '.\ci' -SkipRegistration
 
 # Short and interactive, on the machine itself.
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\actions-runner\provision.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Program Files\actions-runner\provision.ps1' `
     -ServiceAccount '.\ci' -SkipToolchain
 ```
 
@@ -672,9 +672,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\provision.ps1 `
     -ServiceAccount '.\ci' -n 3 -Instance 2
 ```
 
-Instance 1 keeps `C:\actions-runner` and its existing name and service;
-instances 2..N are `C:\actions-runner-2`, `-3` and so on, each registered under
-its own name and therefore its own `actions.runner.*` service.
+Each instance has two roots. The runner install (binaries, registration,
+`_diag`, and the `RunnerService.exe` the service starts) is at
+`C:\Program Files\actions-runner`, `-2`, `-3` and so on (`-RunnerRoot`). The
+working data (`_work`, hooks, `.cargo`, `.gitconfig`) is at `C:\actions-runner`,
+`-2`, `-3` (`-DataRoot`). Each instance is registered under its own name and
+therefore its own `actions.runner.*` service.
+
+**Why the install is under Program Files.** A Windows feature upgrade, which
+every Insider build is, reinstalls the OS in place and rebuilds the service
+table from a migration pass. That pass does not keep a service whose binary is
+at `C:\actions-runner\bin`. `C:\Windows\Panther\setupact.log` shows
+
+```
+CAddSystemServicesExpander::ExtractImagePath: Failed to extract file path from
+actions.runner.jkuracing.win-...::ImagePath=["C:\actions-runner\bin\RunnerService.exe"]
+```
+
+and after the upgrade the services do not exist (`sc qc` returns 1060). The
+runner files, the registration and the `ci` account remain, so nothing starts
+on boot and GitHub shows the runners offline. The third-party services that the
+upgrade keeps are all under Program Files. The data stays out of Program Files
+because some build scripts fail on a path that contains a space.
+
+**Moving from the old layout.** Re-run the provisioner. For each instance that
+still has its runner install in the data root, it unregisters the old service
+there (when it still exists), registers from the install root, and then deletes
+the old runner files from the data root. `_work`, hooks, `.cargo` and `_diag`
+stay, so caches remain warm.
 
 **It prompts for the service account password once per instance registered.**
 `config.cmd` is deliberately not run with `--unattended`, so the password is
