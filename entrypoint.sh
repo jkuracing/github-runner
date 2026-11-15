@@ -346,6 +346,16 @@ echo "Cargo: CARGO_INCREMENTAL=${CARGO_INCREMENTAL} CARGO_PROFILE_DEV_DEBUG=${CA
 echo "Sweep: target/ budget ${SWEEP_MAX_GB} GB per replica, plus ${SWEEP_TMP_DIR} leftovers, enforced after each job"
 echo "Gitconfig: reset to a clean baseline before each job (ACTIONS_RUNNER_HOOK_JOB_STARTED)"
 
+# Between-job sweeps miss cancelled jobs, old runner versions and the tool
+# cache, so a periodic sweep also runs while the replica is idle. It shares
+# SWEEP_LOCK with job-started-hook.sh, so a job never starts mid-sweep. See
+# periodic-sweep.sh.
+export SWEEP_LOCK=/tmp/runner-sweep.lock
+export SWEEP_INTERVAL_MIN="${SWEEP_INTERVAL_MIN:-30}"
+export SWEEP_TOOL_DAYS="${SWEEP_TOOL_DAYS:-7}"
+echo "Sweep: also every ${SWEEP_INTERVAL_MIN} min while idle (old runner versions, _update, tool versions older than ${SWEEP_TOOL_DAYS} d)"
+gosu runner /usr/local/bin/periodic-sweep.sh --loop &
+
 echo "Starting runner..."
 gosu runner ./run.sh &
 RUNNER_PID=$!
