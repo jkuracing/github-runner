@@ -140,6 +140,28 @@ Between jobs, `job-completed-hook.sh` keeps each replica's `_work` under
 `SWEEP_MAX_GB` (2 GB by default) by deleting the largest `target/` dirs, and
 clears pytest and `cargo install` leftovers from `/tmp`.
 
+The completed hook does not run for a cancelled or killed job, and it does not
+touch the runner's own leftovers. So `periodic-sweep.sh` also runs in every
+replica, every `SWEEP_INTERVAL_MIN` minutes (30 by default), while no job runs:
+
+| Removes | Why it grows |
+|---|---|
+| `target/` dirs over `SWEEP_MAX_GB`, `/tmp` leftovers | Same as the completed hook; catches jobs that skipped it. |
+| `bin.<ver>`, `externals.<ver>` the symlinks do not point at | Each runner self-update leaves the old version (~0.4 GB). |
+| `_work/_update`, once a day old | The staging copy of a finished self-update (~0.45 GB). |
+| `_work/_tool/<tool>/<ver>` except the newest, once older than `SWEEP_TOOL_DAYS` (7) | setup-python and setup-uv add versions and never drop one. |
+
+A sweep holds `SWEEP_LOCK`, and `job-started-hook.sh` waits for that lock, so a
+job assigned mid-sweep starts when the sweep ends. A job still in flight can go
+over the budget; the next sweep brings it back.
+
+`tests/periodic-sweep-test.sh` checks this against a fake runner layout in a
+throwaway container, never a live replica:
+
+```bash
+docker run --rm --entrypoint bash -v "$PWD:/src:ro" github-runner-runner-1 /src/tests/periodic-sweep-test.sh
+```
+
 Toolchains a job installs land on that replica's writable layer, once per
 replica. To keep them in the shared image instead, run `./update.sh` after
 each Rust stable release (see below), and bump `RUST_PINNED_TOOLCHAINS` in the

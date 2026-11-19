@@ -286,6 +286,7 @@ LABEL org.jkuracing.rust-stable="${RUST_STABLE_VERSION}"
 COPY entrypoint.sh /entrypoint.sh
 COPY job-completed-hook.sh /usr/local/bin/job-completed-hook.sh
 COPY job-started-hook.sh /usr/local/bin/job-started-hook.sh
+COPY periodic-sweep.sh /usr/local/bin/periodic-sweep.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/job-completed-hook.sh /usr/local/bin/job-started-hook.sh
 
 # Create a non-root user and copy tools

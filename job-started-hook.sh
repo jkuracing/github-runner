@@ -56,6 +56,14 @@ set -uo pipefail
 
 rm -f "${GIT_CONFIG_GLOBAL:-${HOME:-/home/runner}/.gitconfig}"
 
+# Wait for a periodic sweep in progress (periodic-sweep.sh), so the job does
+# not check out or build into a _work that is being deleted. Only entrypoint.sh
+# sets SWEEP_LOCK; the macOS and Windows instances run no periodic sweep and
+# skip this. The timeout keeps a stuck sweep from holding jobs forever.
+if [[ -n "${SWEEP_LOCK:-}" ]]; then
+  flock -w 900 "$SWEEP_LOCK" true 2>/dev/null || true
+fi
+
 # Never fail the job. Like job-completed-hook.sh, this runs adjacent to work
 # that must not be put at risk by a cleanup step -- a non-zero exit here would
 # fail the job it is meant to protect.
