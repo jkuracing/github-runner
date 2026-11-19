@@ -155,6 +155,13 @@ A sweep holds `SWEEP_LOCK`, and `job-started-hook.sh` waits for that lock, so a
 job assigned mid-sweep starts when the sweep ends. A job still in flight can go
 over the budget; the next sweep brings it back.
 
+`tests/periodic-sweep-test.sh` checks this against a fake runner layout in a
+throwaway container, never a live replica:
+
+```bash
+docker run --rm --entrypoint bash -v "$PWD:/src:ro" github-runner-runner-1 /src/tests/periodic-sweep-test.sh
+```
+
 Toolchains a job installs land on that replica's writable layer, once per
 replica. To keep them in the shared image instead, run `./update.sh` after
 each Rust stable release (see below), and bump `RUST_PINNED_TOOLCHAINS` in the

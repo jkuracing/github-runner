@@ -95,7 +95,8 @@ sweep_once() {
   fi
   local before after
   before=$(du -sm "$WORK_DIR" 2>/dev/null | cut -f1)
-  [[ -x "$COMPLETED_HOOK" ]] && "$COMPLETED_HOOK" | sed 's/^/periodic-sweep: /'
+  # Through bash, as the runner itself starts hooks: the file need not be +x.
+  [[ -f "$COMPLETED_HOOK" ]] && bash "$COMPLETED_HOOK" | sed 's/^/periodic-sweep: /'
   sweep_runner_versions
   sweep_tool_cache
   after=$(du -sm "$WORK_DIR" 2>/dev/null | cut -f1)
